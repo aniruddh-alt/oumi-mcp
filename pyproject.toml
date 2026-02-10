@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oumi-mcp"
+version = "0.1.0"
+description = "MCP server for discovering and managing Oumi ML training configs"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Oumi Team", email = "contact@oumi.ai" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastmcp>=3.0.0b1",
+    "httpx>=0.28.1",
+    "huggingface-hub>=0.36.0",
+    "mcp[cli]>=1.25.0",
+    "oumi>=0.6.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/oumi-ai/oumi"
+Issues = "https://github.com/oumi-ai/oumi/issues"
+
+[project.scripts]
+oumi-mcp = "oumi_mcp_server.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+oumi_mcp_server = [
+    "configs/**/*.yaml",
+    "configs/**/*.md",
+]
+
+[tool.uv]
+package = true
+prerelease = "allow"

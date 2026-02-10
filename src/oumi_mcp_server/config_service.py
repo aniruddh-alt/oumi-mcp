@@ -1,0 +1,404 @@
+"""Configuration service for parsing and managing Oumi YAML configs."""
+
+import logging
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from oumi_mcp_server.constants import (
+    API_PROVIDERS_DIR,
+    COMMENT_PREFIXES_TO_SKIP,
+    CONFIGS_CACHE_SIZE,
+    DATA_SPLITS,
+    MODEL_FAMILIES_DIR,
+    MODEL_KEYS,
+    TRAIN_YAML,
+    TRAINING_KEYS,
+    YAML_CACHE_SIZE,
+    PeftType,
+    TaskType,
+)
+from oumi_mcp_server.models import (
+    CategoriesResponse,
+    ConfigMetadata,
+    KeySettings,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def get_bundled_configs_dir() -> Path:
+    """Get the path to the bundled configs shipped with the package.
+
+    Returns:
+        Path to the configs directory inside the installed package.
+    """
+    return Path(__file__).parent / "configs"
+
+
+def get_cache_dir() -> Path:
+    """Get the path to the user-level config cache directory.
+
+    Returns:
+        Path to ~/.cache/oumi-mcp/configs.
+    """
+    return Path.home() / ".cache" / "oumi-mcp" / "configs"
+
+
+def get_configs_dir() -> Path:
+    """Get the path to the configs directory.
+
+    Resolution order (first that exists and contains YAML files wins):
+    1. OUMI_MCP_CONFIGS_DIR environment variable (explicit override)
+    2. ~/.cache/oumi-mcp/configs (synced from GitHub, fresher)
+    3. Bundled configs shipped with the package (always available fallback)
+
+    Returns:
+        Path to the configs directory.
+    """
+    # 1. Explicit override
+    env_dir = os.environ.get("OUMI_MCP_CONFIGS_DIR")
+    if env_dir:
+        p = Path(env_dir)
+        if p.is_dir() and any(p.rglob("*.yaml")):
+            return p
+
+    # 2. User cache (populated by config_sync)
+    cache = get_cache_dir()
+    if cache.is_dir() and any(cache.rglob("*.yaml")):
+        return cache
+
+    # 3. Bundled fallback
+    return get_bundled_configs_dir()
+
+
+@lru_cache(maxsize=YAML_CACHE_SIZE)
+def parse_yaml(path: str) -> dict[str, Any]:
+    """Parse a YAML file, returning empty dict on error.
+
+    Args:
+        path: Absolute path to the YAML file.
+
+    Returns:
+        Parsed YAML as dict, or empty dict if parsing fails.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"Failed to parse YAML {path}: {e}")
+        return {}
+
+
+def extract_header_comment(path: Path) -> str:
+    """Extract description from YAML header comments.
+
+    Reads the first lines of the file that start with # and extracts
+    the description, skipping lines that start with common prefixes
+    like "Usage:", "See Also:", etc.
+
+    Args:
+        path: Path to the YAML file.
+
+    Returns:
+        Extracted description from header comments.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").split("\n")
+        comments: list[str] = []
+        for line in lines:
+            if line.startswith("#"):
+                clean = line.lstrip("#").strip()
+                if clean and not any(
+                    clean.startswith(prefix) for prefix in COMMENT_PREFIXES_TO_SKIP
+                ):
+                    comments.append(clean)
+            elif line.strip():
+                break
+        return " ".join(comments[:2])
+    except Exception as e:
+        logger.warning(f"Failed to extract header from {path}: {e}")
+        return ""
+
+
+def infer_task_type(trainer_type: str, path: str) -> TaskType:
+    """Infer task type from trainer_type or file path.
+
+    Checks both the trainer_type field and the path for task indicators
+    like grpo, dpo, sft, eval, infer, etc.
+
+    Args:
+        trainer_type: Value from config.training.trainer_type.
+        path: Relative path to the config file.
+
+    Returns:
+        Inferred task type string.
+    """
+    t = trainer_type.lower()
+    p = path.lower()
+
+    task_mapping: list[tuple[list[str], TaskType]] = [
+        (["grpo"], "grpo"),
+        (["dpo"], "dpo"),
+        (["kto"], "kto"),
+        (["sft"], "sft"),
+    ]
+
+    for keywords, task in task_mapping:
+        if any(kw in t or kw in p for kw in keywords):
+            return task
+
+    # Path-based inference
+    if "eval" in p:
+        return "evaluation"
+    if "infer" in p:
+        return "inference"
+    if "pretrain" in p:
+        return "pretraining"
+    if "synth" in p:
+        return "synthesis"
+    if "quant" in p:
+        return "quantization"
+
+    return ""
+
+
+def extract_datasets(config: dict[str, Any]) -> list[str]:
+    """Extract dataset names from config data section.
+
+    Args:
+        config: Parsed YAML config dict.
+
+    Returns:
+        List of dataset names used in train/validation/test splits.
+    """
+    datasets: list[str] = []
+    data = config.get("data", {})
+
+    for split in DATA_SPLITS:
+        split_data = data.get(split, {})
+        if isinstance(split_data, dict):
+            for ds in split_data.get("datasets", []):
+                if isinstance(ds, dict) and "dataset_name" in ds:
+                    datasets.append(ds["dataset_name"])
+
+    return datasets
+
+
+def determine_peft_type(config: dict[str, Any], path: str) -> PeftType | None:
+    """Determine PEFT type from config and path.
+
+    Args:
+        config: Parsed YAML config dict.
+        path: Relative path to config file.
+
+    Returns:
+        "qlora", "lora", or None if not using PEFT.
+    """
+    peft = config.get("peft", {})
+    if peft.get("lora_r"):
+        return "qlora" if "qlora" in path.lower() else "lora"
+    return None
+
+
+def build_metadata(config_path: Path, configs_dir: Path) -> ConfigMetadata:
+    """Build metadata dict for a config file.
+
+    Args:
+        config_path: Absolute path to the YAML config file.
+        configs_dir: Root configs directory for calculating relative path.
+
+    Returns:
+        ConfigMetadata with extracted information.
+    """
+    rel_path = str(config_path.relative_to(configs_dir))
+    config = parse_yaml(str(config_path))
+
+    model = config.get("model", {})
+    training = config.get("training", {})
+
+    return {
+        "path": rel_path,
+        "description": extract_header_comment(config_path),
+        "model_name": model.get("model_name", "") or "",
+        "task_type": infer_task_type(training.get("trainer_type", ""), rel_path),
+        "datasets": extract_datasets(config) or [],
+        "reward_functions": training.get("reward_functions") or [],
+        "peft_type": determine_peft_type(config, rel_path) or "",
+    }
+
+
+@lru_cache(maxsize=CONFIGS_CACHE_SIZE)
+def get_all_configs() -> list[ConfigMetadata]:
+    """Get metadata for all configs (cached).
+
+    Returns:
+        List of ConfigMetadata for all YAML files in configs directory.
+    """
+    configs_dir = get_configs_dir()
+    configs: list[ConfigMetadata] = []
+
+    for path in configs_dir.rglob("*.yaml"):
+        configs.append(build_metadata(path, configs_dir))
+
+    return configs
+
+
+def extract_key_settings(config: dict[str, Any]) -> KeySettings:
+    """Extract key training settings from config.
+
+    Args:
+        config: Parsed YAML config dict.
+
+    Returns:
+        KeySettings with important hyperparameters.
+    """
+    training = config.get("training", {})
+    model_cfg = config.get("model", {})
+
+    key_settings: KeySettings = {}
+
+    for key in TRAINING_KEYS:
+        if training.get(key) is not None:
+            key_settings[key] = training[key]  # type: ignore[literal-required]
+
+    for key in MODEL_KEYS:
+        if model_cfg.get(key) is not None:
+            if key == "torch_dtype_str":
+                key_settings["torch_dtype"] = model_cfg[key]
+            else:
+                key_settings[key] = model_cfg[key]  # type: ignore[literal-required]
+
+    return key_settings
+
+
+def find_config_match(
+    path_query: str, configs: list[ConfigMetadata]
+) -> ConfigMetadata | None:
+    """Find the best matching config for a path query.
+
+    Args:
+        path_query: Path query string (exact or partial match).
+        configs: List of all configs to search.
+
+    Returns:
+        Best matching ConfigMetadata, or None if no match found.
+    """
+    path_lower = path_query.lower()
+    candidates: list[ConfigMetadata] = []
+
+    # Find all candidates
+    for cfg in configs:
+        if cfg["path"] == path_query:
+            return cfg  # Exact match found
+        if path_lower in cfg["path"].lower():
+            candidates.append(cfg)
+
+    if not candidates:
+        return None
+
+    # Prefer exact train.yaml match
+    for c in candidates:
+        if c["path"].endswith(f"/{TRAIN_YAML}"):
+            return c
+
+    # Fallback to any train.yaml variant
+    for c in candidates:
+        if TRAIN_YAML in c["path"]:
+            return c
+
+    # Return first candidate
+    return candidates[0]
+
+
+def search_configs(
+    configs: list[ConfigMetadata],
+    query: str = "",
+    task: str = "",
+    model: str = "",
+    keyword: str = "",
+    limit: int = 20,
+) -> list[ConfigMetadata]:
+    """Search for configs matching the given filters.
+
+    Args:
+        configs: List of all configs to search.
+        query: General search term (case-insensitive substring match).
+        task: Task type filter.
+        model: Model family filter.
+        keyword: Case-insensitive substring match on file content.
+        limit: Maximum number of results to return.
+
+    Returns:
+        List of matching ConfigMetadata, sorted by relevance.
+    """
+    filters: list[str] = []
+    if query:
+        filters.append(query.lower())
+    if task:
+        filters.append(task.lower())
+    if model:
+        filters.append(model.lower())
+
+    keyword_lower = keyword.lower().strip()
+
+    if not filters and not keyword_lower:
+        # Return a sample of configs sorted alphabetically
+        return sorted(configs, key=lambda x: x["path"])[:limit]
+
+    matches: list[ConfigMetadata] = []
+    configs_dir = get_configs_dir() if keyword_lower else None
+    for cfg in configs:
+        path_lower = cfg["path"].lower()
+        if not all(f in path_lower for f in filters):
+            continue
+        if keyword_lower and configs_dir is not None:
+            config_path = configs_dir / cfg["path"]
+            try:
+                content = config_path.read_text(encoding="utf-8").lower()
+            except Exception:
+                continue
+            if keyword_lower not in content:
+                continue
+        matches.append(cfg)
+
+    # Sort: prefer configs with datasets defined, then alphabetically
+    matches.sort(key=lambda x: (-len(x["datasets"]), x["path"]))
+    return matches[:limit]
+
+
+def get_categories(configs_dir: Path, configs_count: int) -> CategoriesResponse:
+    """List available config categories and model families.
+
+    Args:
+        configs_dir: Root configs directory.
+        configs_count: Total number of configs.
+
+    Returns:
+        CategoriesResponse with all available categories.
+    """
+    categories: list[str] = []
+    model_families: list[str] = []
+    api_providers: list[str] = []
+
+    for item in sorted(configs_dir.iterdir()):
+        if item.is_dir():
+            categories.append(item.name)
+            if item.name == MODEL_FAMILIES_DIR:
+                model_families = sorted(
+                    d.name
+                    for d in item.iterdir()
+                    if d.is_dir() and d.name != "README.md"
+                )
+            elif item.name == API_PROVIDERS_DIR:
+                api_providers = sorted(d.name for d in item.iterdir() if d.is_dir())
+
+    return {
+        "categories": categories,
+        "model_families": model_families,
+        "api_providers": api_providers,
+        "total_configs": configs_count,
+    }

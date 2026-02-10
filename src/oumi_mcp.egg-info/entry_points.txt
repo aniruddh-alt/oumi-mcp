@@ -1,0 +1,2 @@
+[console_scripts]
+oumi-mcp = oumi_mcp_server.server:main
