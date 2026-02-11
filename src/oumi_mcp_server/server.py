@@ -15,6 +15,11 @@ TOOLS -- Discovery:
     - get_config: Get config details and full YAML content
     - validate_config: Validate configs before running
     - pre_flight_check: Catch issues before launch (HF auth, hardware, paths)
+    - get_docs: Search Oumi Python API docs (classes, fields, functions)
+      for tool discovery and parameter lookup. Supports exact qualified-name
+      match, exact short-name match, and relevance-ranked keyword search.
+    - list_modules: List indexed API modules with class/function counts.
+      Use this first to discover available namespaces before calling get_docs.
 
 TOOLS -- Execution:
     - run_oumi_job: Execute any Oumi command (local or cloud)
@@ -104,6 +109,11 @@ from oumi_mcp_server.constants import (
     VALID_OUMI_COMMANDS,
     ValidatorTaskType,
 )
+from oumi_mcp_server.docs_service import (
+    get_module_list,
+    search_docs,
+    start_background_indexing,
+)
 from oumi_mcp_server.job_service import (
     JobRecord,
     cancel,
@@ -120,12 +130,14 @@ from oumi_mcp_server.models import (
     CategoriesResponse,
     ConfigDetail,
     ConfigMetadata,
+    DocsSearchResponse,
     HardwareInfo,
     JobCancelResponse,
     JobLogsResponse,
     JobStatusResponse,
     JobSubmissionResponse,
     JobSummary,
+    ListModulesResponse,
     PreFlightCheckResponse,
 )
 from oumi_mcp_server.prompts.mle_prompt import (
@@ -785,6 +797,8 @@ def get_started() -> str:
 | `get_config(path, include_content)` | Get config details/YAML | `get_config("llama3_1/sft/8b_lora", include_content=True)` |
 | `validate_config(config, task_type)` | Validate before training | `validate_config("/path/to/config.yaml", "training")` |
 | `pre_flight_check(config)` | Catch issues before launch (HF auth, hardware, paths) | `pre_flight_check("/path/to/config.yaml")` |
+| `get_docs(query, module, kind)` | Search Oumi Python API docs | `get_docs("TrainingConfig")` |
+| `list_modules()` | List indexed API modules | `list_modules()` |
 
 ### Execution
 | Tool | Purpose | Example |
@@ -890,6 +904,7 @@ async def run_oumi_job(
        You must also provide ``user_confirmation="EXECUTE"`` to explicitly
        authorize execution. The process runs in the background and returns
        a ``job_id`` immediately.
+       For cloud runs, a pre-flight check is executed and may block launch.
 
     Use ``get_job_status(job_id)`` for a status snapshot.
     Use ``get_job_logs(job_id, lines=...)`` for a bounded log snapshot.
@@ -1032,6 +1047,31 @@ async def run_oumi_job(
             ),
         }
 
+    preflight_summary = ""
+    preflight_blocking = False
+    preflight_errors: list[str] = []
+    preflight_warnings: list[str] = []
+
+    if cloud != "local":
+        preflight = pre_flight_check(abs_config)
+        preflight_summary = preflight.get("summary", "")
+        preflight_blocking = bool(preflight.get("blocking"))
+        preflight_errors = preflight.get("errors", []) or []
+        preflight_warnings = preflight.get("warnings", []) or []
+        if preflight_blocking:
+            return _error_response(
+                f"Pre-flight checks failed: {preflight_summary}",
+                status="blocked",
+                job_id=job_id,
+                config_path=abs_config,
+                model_name=model_name,
+                output_dir=output_dir,
+                preflight_summary=preflight_summary,
+                preflight_blocking=preflight_blocking,
+                preflight_errors=preflight_errors,
+                preflight_warnings=preflight_warnings,
+            )
+
     record = JobRecord(
         job_id=job_id,
         command=command,
@@ -1075,12 +1115,50 @@ async def run_oumi_job(
         )
     record.runner_task = runner
 
+    launch_confirmed = False
+    if not record.is_local:
+        try:
+            await asyncio.wait_for(asyncio.shield(runner), timeout=10.0)
+            launch_confirmed = record.error_message is None
+        except asyncio.TimeoutError:
+            launch_confirmed = False
+        except Exception:
+            launch_confirmed = False
+
     logger.info(
         "Job %s submitted on %s — launching `oumi %s` in background",
         job_id,
         cloud,
         command,
     )
+
+    if record.error_message and not record.is_local:
+        return _error_response(
+            f"Failed to launch cloud job: {record.error_message}",
+            status="failed",
+            job_id=job_id,
+            config_path=abs_config,
+            model_name=model_name,
+            output_dir=output_dir,
+            preflight_summary=preflight_summary,
+            preflight_blocking=preflight_blocking,
+            preflight_errors=preflight_errors,
+            preflight_warnings=preflight_warnings,
+            launch_confirmed=launch_confirmed,
+            oumi_job_id=record.oumi_job_id,
+            cluster=record.cluster_name,
+        )
+
+    message = (
+        f"Job {job_id} submitted on {cloud}. "
+        f"Use get_job_status('{job_id}') for status and "
+        f"get_job_logs('{job_id}', lines=200) for logs."
+    )
+    if not record.is_local and not launch_confirmed:
+        message = (
+            message
+            + " Launch confirmation is pending; re-check status shortly."
+        )
 
     return {
         "success": True,
@@ -1093,11 +1171,14 @@ async def run_oumi_job(
         "cluster_name": cluster_name,
         "model_name": model_name,
         "output_dir": output_dir,
-        "message": (
-            f"Job {job_id} submitted on {cloud}. "
-            f"Use get_job_status('{job_id}') for status and "
-            f"get_job_logs('{job_id}', lines=200) for logs."
-        ),
+        "launch_confirmed": launch_confirmed if not record.is_local else True,
+        "preflight_summary": preflight_summary,
+        "preflight_blocking": preflight_blocking,
+        "preflight_errors": preflight_errors,
+        "preflight_warnings": preflight_warnings,
+        "oumi_job_id": record.oumi_job_id,
+        "cluster": record.cluster_name,
+        "message": message,
     }
 
 
@@ -1369,6 +1450,89 @@ async def list_jobs(
         }
         for r in records
     ]
+
+
+@mcp.tool()
+def get_docs(
+    query: str,
+    module: str = "",
+    kind: str = "",
+    limit: int = 10,
+) -> DocsSearchResponse:
+    """Search Oumi's indexed Python API docs for agent tool discovery.
+
+    This tool is optimized for agents that need to discover API surface area
+    quickly and with minimal context switching. It searches an in-memory index
+    of classes, dataclasses, functions, and methods across the modules listed
+    by ``list_modules()``.
+
+    Matching strategy (in order):
+    1. Exact qualified name match
+       Example: ``oumi.core.configs.params.training_params.TrainingParams``
+    2. Exact short-name match (case-insensitive)
+       Example: ``TrainingParams``
+    3. Relevance-ranked keyword search over names, dataclass fields, summaries,
+       and docstring sections
+       Example: ``learning_rate``
+
+    Agent discovery workflow:
+    1. Call ``list_modules()`` to discover indexed namespaces.
+    2. Call ``get_docs(query, module=..., kind=...)`` to narrow results.
+    3. Read ``signature``, ``fields``, and ``sections`` from returned entries
+       to infer valid parameters and usage patterns.
+
+    Args:
+        query: Search term. Can be an exact qualified name
+               (e.g. "oumi.core.configs.TrainingConfig"), a short class name
+               (e.g. "TrainingConfig"), or a keyword (e.g. "learning_rate").
+        module: Optional module prefix filter (e.g. "oumi.core.configs").
+        kind: Optional kind filter: "class", "dataclass", "function", or "method".
+        limit: Maximum number of results to return (default 10).
+
+    Returns:
+        DocsSearchResponse with:
+        - results: Matching documentation entries with name, kind, summary,
+          fields (for dataclasses), signature, and parsed docstring sections.
+        - query: The original search query.
+        - total_matches: Total matches before limiting.
+        - index_ready: False if background indexing hasn't finished yet.
+        - error: Error message if something went wrong.
+
+    Examples:
+        - get_docs("TrainingConfig") -> Full TrainingConfig docs with fields
+        - get_docs("ModelParams") -> ModelParams with per-field docstrings
+        - get_docs("learning_rate") -> Find fields named learning_rate
+        - get_docs("lora", module="oumi.core.configs") -> Filtered search
+        - get_docs("infer", kind="function") -> Kind-filtered search
+    """
+    return search_docs(query=query, module=module, kind=kind, limit=limit)
+
+
+@mcp.tool()
+def list_modules() -> ListModulesResponse:
+    """List modules currently indexed for ``get_docs`` tool discovery.
+
+    This is the entry point for documentation discovery. It returns the module
+    namespaces available to ``get_docs`` plus light inventory metadata so
+    agents can choose a narrow search scope.
+
+    Recommended usage:
+    1. Call ``list_modules()`` once to discover candidate namespaces.
+    2. Select one module prefix (for example ``oumi.core.configs``).
+    3. Call ``get_docs(query, module=<prefix>)`` for precise retrieval.
+    4. If no results, broaden to fewer filters or a higher-level module prefix.
+
+    Returns:
+        ListModulesResponse with:
+        - modules: Per-module summaries (module path, description, counts).
+        - total_entries: Total number of indexed documentation entries.
+        - index_ready: Whether background indexing has completed.
+
+    Examples:
+        - list_modules() -> See all indexed modules with class counts
+        - Then use get_docs("TrainingConfig") to look up specific classes
+    """
+    return get_module_list()
 
 
 @mcp.resource("jobs://running", mime_type="application/json")
@@ -1658,6 +1822,8 @@ def main() -> None:
 
     if yaml_count == 0:
         logger.error("No configs available. Server may not function correctly.")
+
+    start_background_indexing()
 
     mcp.run()
 
