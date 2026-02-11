@@ -202,6 +202,31 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("Oumi Config Server")
 
 
+def _resolve_config_path(config: str) -> tuple[Path, str | None]:
+    """Resolve and validate a config file path.
+
+    Requires an absolute path (after ``~`` expansion). Returns a clear error
+    when a relative path is given so callers surface an actionable message
+    instead of silently resolving against the MCP server's working directory.
+
+    Returns:
+        ``(resolved_path, None)`` on success, or ``(Path(), error_message)``
+        on failure.
+    """
+    p = Path(config).expanduser()
+    if not p.is_absolute():
+        return Path(), (
+            f"Path must be absolute, got relative path: '{config}'. "
+            f"Provide the full path (e.g. '/home/user/configs/{Path(config).name}')."
+        )
+    p = p.resolve()
+    if not p.exists():
+        return Path(), f"Config file not found: {p}"
+    if not p.is_file():
+        return Path(), f"Config path is not a file: {p}"
+    return p, None
+
+
 @mcp.resource("guidance://mle-workflow")
 async def get_mle_workflow_guidance() -> str:
     """ML engineering workflow guidance for Oumi.
@@ -448,12 +473,12 @@ def pre_flight_check(config: str) -> PreFlightCheckResponse:
     warnings: list[str] = []
     repo_access: dict[str, str] = {}
 
-    config_path = Path(config)
-    if not config_path.exists():
-        errors.append(f"Config file not found: {config}")
+    config_path, path_error = _resolve_config_path(config)
+    if path_error:
+        errors.append(path_error)
         return {
             "blocking": True,
-            "summary": f"BLOCKED: Config file not found: {config}",
+            "summary": f"BLOCKED: {path_error}",
             "hf_authenticated": False,
             "repo_access": {},
             "hardware": _empty_hardware(),
@@ -573,7 +598,9 @@ def validate_paths(cfg: dict, base_dir: Path) -> dict[str, bool]:
                     p = Path(val).expanduser()
                     if not p.is_absolute():
                         p = base_dir / p
-                    paths[val] = p.exists()
+                        paths[f"{val} (resolved to {p})"] = p.exists()
+                    else:
+                        paths[val] = p.exists()
                 else:
                     _extract(val)
         elif isinstance(obj, list):
@@ -764,9 +791,9 @@ def validate_config(config: str, task_type: ValidatorTaskType) -> dict:
         - validate_config("/path/to/eval.yaml", "evaluation")
         - validate_config("/path/to/infer.yaml", "inference")
     """
-    config_path = Path(config)
-    if not config_path.exists():
-        return {"ok": False, "error": f"Config file not found: {config}"}
+    config_path, path_error = _resolve_config_path(config)
+    if path_error:
+        return {"ok": False, "error": path_error}
     try:
         cfg = TASK_MAPPING[task_type].from_yaml(config_path)
         cfg.finalize_and_validate()
@@ -977,13 +1004,11 @@ async def run_oumi_job(
             f"Must be one of: {sorted(VALID_OUMI_COMMANDS)}"
         )
 
-    config_file = Path(config_path)
-    if not config_file.exists():
-        return _error_response(f"Config file not found: {config_path}")
-    if not config_file.is_file():
-        return _error_response(f"Config path is not a file: {config_path}")
+    config_file, path_error = _resolve_config_path(config_path)
+    if path_error:
+        return _error_response(path_error)
 
-    abs_config = str(config_file.resolve())
+    abs_config = str(config_file)
     try:
         meta = extract_job_metadata(abs_config)
         model_name = meta["model_name"]
@@ -1458,6 +1483,7 @@ def get_docs(
     module: str = "",
     kind: str = "",
     limit: int = 10,
+    examples: bool = False
 ) -> DocsSearchResponse:
     """Search Oumi's indexed Python API docs for agent tool discovery.
 
