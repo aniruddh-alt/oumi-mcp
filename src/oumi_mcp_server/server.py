@@ -1485,7 +1485,7 @@ def get_docs(
     module: str = "",
     kind: str = "",
     limit: int = 10,
-    examples: bool = False,
+    summarize: bool = False,
 ) -> DocsSearchResponse:
     """Search Oumi's indexed Python API docs for agent tool discovery.
 
@@ -1516,6 +1516,8 @@ def get_docs(
         module: Optional module prefix filter (e.g. "oumi.core.configs").
         kind: Optional kind filter: "class", "dataclass", "function", or "method".
         limit: Maximum number of results to return (default 10).
+        summarize: If True, return compact entries that focus on high-level
+            metadata and summary text (omits fields and docstring sections).
 
     Returns:
         DocsSearchResponse with:
@@ -1533,7 +1535,9 @@ def get_docs(
         - get_docs("lora", module="oumi.core.configs") -> Filtered search
         - get_docs("infer", kind="function") -> Kind-filtered search
     """
-    return search_docs(query=query, module=module, kind=kind, limit=limit)
+    return search_docs(
+        query=query, module=module, kind=kind, limit=limit, summarize=summarize
+    )
 
 
 @mcp.tool()

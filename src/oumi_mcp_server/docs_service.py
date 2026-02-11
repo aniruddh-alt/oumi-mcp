@@ -417,6 +417,7 @@ def search_docs(
     module: str = "",
     kind: str = "",
     limit: int = DOCS_MAX_RESULTS,
+    summarize: bool = False,
     examples: bool | None = None,
 ) -> DocsSearchResponse:
     """Search the documentation index.
@@ -431,115 +432,116 @@ def search_docs(
         module: Optional module prefix filter.
         kind: Optional kind filter ("class", "dataclass", "function", "method").
         limit: Maximum results to return.
+        summarize: If True, return compact entries with only summary-centric
+            content (empty fields/sections).
+        examples: Reserved for future filtering behavior.
 
     Returns:
         DocsSearchResponse with matching entries.
     """
-    error_msg = ""
 
-    if limit < 1:
+    def _to_summary_entry(entry: DocEntry) -> DocEntry:
         return {
-            "results": [],
-            "query": query,
-            "total_matches": 0,
-            "index_ready": _index_ready.is_set(),
-            "error": "limit must be >= 1.",
+            "qualified_name": entry["qualified_name"],
+            "name": entry["name"],
+            "kind": entry["kind"],
+            "module": entry["module"],
+            "summary": entry["summary"],
+            "sections": [],
+            "fields": [],
+            "signature": entry["signature"],
+            "parent_class": entry["parent_class"],
         }
-    if limit > DOCS_MAX_RESULTS:
-        error_msg = f"limit capped to {DOCS_MAX_RESULTS}."
-        limit = DOCS_MAX_RESULTS
 
     is_ready = _index_ready.is_set()
-
-    if not query.strip():
-        return {
-            "results": [],
-            "query": query,
-            "total_matches": 0,
-            "index_ready": is_ready,
-            "error": "Query cannot be empty.",
-        }
-
-    with _index_lock:
-        index = list(_index)
-        qualified_name_map = dict(_qualified_name_map)
-        name_lower_map = {k: list(v) for k, v in _name_lower_map.items()}
-        search_blobs = list(_search_blobs)
-
-    if not index:
-        return {
-            "results": [],
-            "query": query,
-            "total_matches": 0,
-            "index_ready": is_ready,
-            "error": "Index is empty." if is_ready else "Index is still building.",
-        }
-
     query_stripped = query.strip()
-    query_lower = query_stripped.lower()
     module_lower = module.strip().lower()
     kind_lower = kind.strip().lower()
+    error_msg = ""
+    results: list[DocEntry] = []
+    total_matches = 0
 
-    def _entry_matches_filters(entry: DocEntry) -> bool:
-        if module_lower and not entry["module"].lower().startswith(module_lower):
-            return False
-        if kind_lower and entry["kind"].lower() != kind_lower:
-            return False
-        return True
+    if limit < 1:
+        error_msg = "limit must be >= 1."
+    else:
+        if limit > DOCS_MAX_RESULTS:
+            error_msg = f"limit capped to {DOCS_MAX_RESULTS}."
+            limit = DOCS_MAX_RESULTS
 
-    filtered_blobs = search_blobs
-    if module_lower:
-        filtered_blobs = [
-            blob
-            for blob in filtered_blobs
-            if blob["module_lower"].startswith(module_lower)
-        ]
-    if kind_lower:
-        filtered_blobs = [
-            blob for blob in filtered_blobs if blob["kind_lower"] == kind_lower
-        ]
+        if not query_stripped:
+            error_msg = "Query cannot be empty."
+        else:
+            with _index_lock:
+                index = list(_index)
+                qualified_name_map = dict(_qualified_name_map)
+                name_lower_map = {k: list(v) for k, v in _name_lower_map.items()}
+                search_blobs = list(_search_blobs)
 
-    exact_qual = [
-        e
-        for e in qualified_name_map.get(query_stripped, [])
-        if _entry_matches_filters(e)
-    ]
-    if exact_qual:
-        return {
-            "results": exact_qual[:limit],
-            "query": query,
-            "total_matches": len(exact_qual),
-            "index_ready": is_ready,
-            "error": error_msg,
-        }
+            if not index:
+                error_msg = (
+                    "Index is empty." if is_ready else "Index is still building."
+                )
+            else:
+                query_lower = query_stripped.lower()
 
-    exact_name = [
-        e for e in name_lower_map.get(query_lower, []) if _entry_matches_filters(e)
-    ]
-    if exact_name:
-        return {
-            "results": exact_name[:limit],
-            "query": query,
-            "total_matches": len(exact_name),
-            "index_ready": is_ready,
-            "error": error_msg,
-        }
+                def _entry_matches_filters(entry: DocEntry) -> bool:
+                    if module_lower and not entry["module"].lower().startswith(
+                        module_lower
+                    ):
+                        return False
+                    if kind_lower and entry["kind"].lower() != kind_lower:
+                        return False
+                    return True
 
-    scored: list[tuple[float, int, DocEntry]] = []
-    total = 0
-    for idx, blob in enumerate(filtered_blobs):
-        score = _score_entry(blob, query_lower)
-        if score > 0:
-            total += 1
-            scored.append((score, -idx, blob["entry"]))
+                filtered_blobs = search_blobs
+                if module_lower:
+                    filtered_blobs = [
+                        blob
+                        for blob in filtered_blobs
+                        if blob["module_lower"].startswith(module_lower)
+                    ]
+                if kind_lower:
+                    filtered_blobs = [
+                        blob
+                        for blob in filtered_blobs
+                        if blob["kind_lower"] == kind_lower
+                    ]
 
-    top_results = heapq.nlargest(limit, scored)
-    results = [entry for _, __, entry in top_results]
+                exact_qual = [
+                    e
+                    for e in qualified_name_map.get(query_stripped, [])
+                    if _entry_matches_filters(e)
+                ]
+                if exact_qual:
+                    total_matches = len(exact_qual)
+                    results = exact_qual[:limit]
+                else:
+                    exact_name = [
+                        e
+                        for e in name_lower_map.get(query_lower, [])
+                        if _entry_matches_filters(e)
+                    ]
+                    if exact_name:
+                        total_matches = len(exact_name)
+                        results = exact_name[:limit]
+                    else:
+                        scored: list[tuple[float, int, DocEntry]] = []
+                        for idx, blob in enumerate(filtered_blobs):
+                            score = _score_entry(blob, query_lower)
+                            if score > 0:
+                                total_matches += 1
+                                scored.append((score, -idx, blob["entry"]))
+
+                        top_results = heapq.nlargest(limit, scored)
+                        results = [entry for _, __, entry in top_results]
+
+    if summarize:
+        results = [_to_summary_entry(entry) for entry in results]
 
     return {
         "results": results,
         "query": query,
-        "total_matches": total,
+        "total_matches": total_matches,
         "index_ready": is_ready,
         "error": error_msg,
     }
