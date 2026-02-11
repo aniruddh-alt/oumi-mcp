@@ -829,7 +829,7 @@ def get_started() -> str:
 | `get_config(path, include_content)` | Get config details/YAML | `get_config("llama3_1/sft/8b_lora", include_content=True)` |
 | `validate_config(config, task_type)` | Validate before training | `validate_config("/path/to/config.yaml", "training")` |
 | `pre_flight_check(config)` | Catch issues before launch (HF auth, hardware, paths) | `pre_flight_check("/path/to/config.yaml")` |
-| `get_docs(query, module, kind)` | Search Oumi Python API docs | `get_docs("TrainingConfig")` |
+| `get_docs(query, module, kind)` | Search Oumi Python API docs | `get_docs(["TrainingConfig"])` |
 | `list_modules()` | List indexed API modules | `list_modules()` |
 
 ### Execution
@@ -1481,7 +1481,7 @@ async def list_jobs(
 
 @mcp.tool()
 def get_docs(
-    query: str,
+    query: list[str],
     module: str = "",
     kind: str = "",
     limit: int = 10,
@@ -1510,9 +1510,10 @@ def get_docs(
        to infer valid parameters and usage patterns.
 
     Args:
-        query: Search term. Can be an exact qualified name
-               (e.g. "oumi.core.configs.TrainingConfig"), a short class name
-               (e.g. "TrainingConfig"), or a keyword (e.g. "learning_rate").
+        query: Search terms. Include one or more exact qualified names,
+               short names, or keywords. Examples:
+               ["oumi.core.configs.TrainingConfig"], ["TrainingConfig"],
+               ["learning_rate", "lora"].
         module: Optional module prefix filter (e.g. "oumi.core.configs").
         kind: Optional kind filter: "class", "dataclass", "function", or "method".
         limit: Maximum number of results to return (default 10).
@@ -1523,17 +1524,17 @@ def get_docs(
         DocsSearchResponse with:
         - results: Matching documentation entries with name, kind, summary,
           fields (for dataclasses), signature, and parsed docstring sections.
-        - query: The original search query.
+        - query: The normalized query terms used for this search.
         - total_matches: Total matches before limiting.
         - index_ready: False if background indexing hasn't finished yet.
         - error: Error message if something went wrong.
 
     Examples:
-        - get_docs("TrainingConfig") -> Full TrainingConfig docs with fields
-        - get_docs("ModelParams") -> ModelParams with per-field docstrings
-        - get_docs("learning_rate") -> Find fields named learning_rate
-        - get_docs("lora", module="oumi.core.configs") -> Filtered search
-        - get_docs("infer", kind="function") -> Kind-filtered search
+        - get_docs(["TrainingConfig"]) -> Full TrainingConfig docs with fields
+        - get_docs(["ModelParams"]) -> ModelParams with per-field docstrings
+        - get_docs(["learning_rate", "lora"]) -> Multi-keyword search
+        - get_docs(["lora"], module="oumi.core.configs") -> Filtered search
+        - get_docs(["infer"], kind="function") -> Kind-filtered search
     """
     return search_docs(
         query=query, module=module, kind=kind, limit=limit, summarize=summarize
@@ -1562,7 +1563,7 @@ def list_modules() -> ListModulesResponse:
 
     Examples:
         - list_modules() -> See all indexed modules with class counts
-        - Then use get_docs("TrainingConfig") to look up specific classes
+        - Then use get_docs(["TrainingConfig"]) to look up specific classes
     """
     return get_module_list()
 

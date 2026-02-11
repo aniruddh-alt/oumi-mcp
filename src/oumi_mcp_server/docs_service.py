@@ -413,7 +413,7 @@ def start_background_indexing() -> threading.Thread:
 
 
 def search_docs(
-    query: str,
+    query: list[str],
     module: str = "",
     kind: str = "",
     limit: int = DOCS_MAX_RESULTS,
@@ -428,7 +428,8 @@ def search_docs(
     3. Scored relevance search across name, fields, summary, and sections.
 
     Args:
-        query: Search term (name, keyword, or qualified path).
+        query: Search terms (names, keywords, or qualified paths). Supports
+            multi-keyword search in a single call.
         module: Optional module prefix filter.
         kind: Optional kind filter ("class", "dataclass", "function", "method").
         limit: Maximum results to return.
@@ -454,7 +455,8 @@ def search_docs(
         }
 
     is_ready = _index_ready.is_set()
-    query_stripped = query.strip()
+    query_terms = [q.strip() for q in query if q.strip()]
+    query_terms_lower = [q.lower() for q in query_terms]
     module_lower = module.strip().lower()
     kind_lower = kind.strip().lower()
     error_msg = ""
@@ -468,7 +470,7 @@ def search_docs(
             error_msg = f"limit capped to {DOCS_MAX_RESULTS}."
             limit = DOCS_MAX_RESULTS
 
-        if not query_stripped:
+        if not query_terms:
             error_msg = "Query cannot be empty."
         else:
             with _index_lock:
@@ -482,7 +484,6 @@ def search_docs(
                     "Index is empty." if is_ready else "Index is still building."
                 )
             else:
-                query_lower = query_stripped.lower()
 
                 def _entry_matches_filters(entry: DocEntry) -> bool:
                     if module_lower and not entry["module"].lower().startswith(
@@ -507,29 +508,46 @@ def search_docs(
                         if blob["kind_lower"] == kind_lower
                     ]
 
-                exact_qual = [
-                    e
-                    for e in qualified_name_map.get(query_stripped, [])
-                    if _entry_matches_filters(e)
-                ]
+                exact_qual: list[DocEntry] = []
+                seen_qual: set[str] = set()
+                for term in query_terms:
+                    for entry in qualified_name_map.get(term, []):
+                        if not _entry_matches_filters(entry):
+                            continue
+                        entry_key = entry["qualified_name"]
+                        if entry_key in seen_qual:
+                            continue
+                        seen_qual.add(entry_key)
+                        exact_qual.append(entry)
                 if exact_qual:
                     total_matches = len(exact_qual)
                     results = exact_qual[:limit]
                 else:
-                    exact_name = [
-                        e
-                        for e in name_lower_map.get(query_lower, [])
-                        if _entry_matches_filters(e)
-                    ]
+                    exact_name: list[DocEntry] = []
+                    seen_name: set[str] = set()
+                    for term_lower in query_terms_lower:
+                        for entry in name_lower_map.get(term_lower, []):
+                            if not _entry_matches_filters(entry):
+                                continue
+                            entry_key = entry["qualified_name"]
+                            if entry_key in seen_name:
+                                continue
+                            seen_name.add(entry_key)
+                            exact_name.append(entry)
                     if exact_name:
                         total_matches = len(exact_name)
                         results = exact_name[:limit]
                     else:
                         scored: list[tuple[float, int, DocEntry]] = []
                         for idx, blob in enumerate(filtered_blobs):
-                            score = _score_entry(blob, query_lower)
-                            if score > 0:
+                            term_scores = [
+                                _score_entry(blob, term_lower)
+                                for term_lower in query_terms_lower
+                            ]
+                            matched_scores = [s for s in term_scores if s > 0]
+                            if matched_scores:
                                 total_matches += 1
+                                score = sum(matched_scores)
                                 scored.append((score, -idx, blob["entry"]))
 
                         top_results = heapq.nlargest(limit, scored)
@@ -540,7 +558,7 @@ def search_docs(
 
     return {
         "results": results,
-        "query": query,
+        "query": query_terms,
         "total_matches": total_matches,
         "index_ready": is_ready,
         "error": error_msg,

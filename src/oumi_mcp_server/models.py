@@ -344,14 +344,14 @@ class DocsSearchResponse(TypedDict):
 
     Attributes:
         results: Matching documentation entries.
-        query: The original search query.
+        query: The normalized query terms used for this search.
         total_matches: Total number of matches before limiting.
         index_ready: Whether background indexing has completed.
         error: Error message, or "" if no error.
     """
 
     results: list[DocEntry]
-    query: str
+    query: list[str]
     total_matches: int
     index_ready: bool
     error: str
