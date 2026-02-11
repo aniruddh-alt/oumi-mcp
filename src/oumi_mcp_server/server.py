@@ -469,6 +469,11 @@ def pre_flight_check(config: str) -> PreFlightCheckResponse:
         - pre_flight_check("/home/user/train.yaml")
         - pre_flight_check("/workspace/configs/llama3_sft.yaml")
     """
+    return _pre_flight_check(config)
+
+
+def _pre_flight_check(config: str) -> PreFlightCheckResponse:
+    """Run pre-flight checks (internal implementation)."""
     errors: list[str] = []
     warnings: list[str] = []
     repo_access: dict[str, str] = {}
@@ -1078,7 +1083,7 @@ async def run_oumi_job(
     preflight_warnings: list[str] = []
 
     if cloud != "local":
-        preflight = pre_flight_check(abs_config)
+        preflight = _pre_flight_check(abs_config)
         preflight_summary = preflight.get("summary", "")
         preflight_blocking = bool(preflight.get("blocking"))
         preflight_errors = preflight.get("errors", []) or []
@@ -1180,10 +1185,7 @@ async def run_oumi_job(
         f"get_job_logs('{job_id}', lines=200) for logs."
     )
     if not record.is_local and not launch_confirmed:
-        message = (
-            message
-            + " Launch confirmation is pending; re-check status shortly."
-        )
+        message = message + " Launch confirmation is pending; re-check status shortly."
 
     return {
         "success": True,
@@ -1483,7 +1485,7 @@ def get_docs(
     module: str = "",
     kind: str = "",
     limit: int = 10,
-    examples: bool = False
+    examples: bool = False,
 ) -> DocsSearchResponse:
     """Search Oumi's indexed Python API docs for agent tool discovery.
 
