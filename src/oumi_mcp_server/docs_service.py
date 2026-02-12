@@ -289,6 +289,8 @@ def _index_module(
         }
         return (entries, info)
 
+    public_exports = set(getattr(mod, "__all__", []))
+
     for name in sorted(dir(mod)):
         if name.startswith("_"):
             continue
@@ -299,7 +301,11 @@ def _index_module(
             continue
         obj_module = getattr(obj, "__module__", None)
         if obj_module and obj_module != module_path:
-            continue
+            is_explicit_reexport = name in public_exports and obj_module.startswith(
+                f"{module_path}."
+            )
+            if not is_explicit_reexport:
+                continue
 
         if inspect.isclass(obj):
             class_entries = _index_class(obj, module_path)
