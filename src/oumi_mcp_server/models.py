@@ -116,6 +116,24 @@ class HardwareInfo(TypedDict):
     packages: dict[str, str]
 
 
+class CloudReadiness(TypedDict):
+    """Cloud credential and readiness status from SkyPilot.
+
+    Attributes:
+        sky_installed: Whether the ``sky`` (SkyPilot) package is importable.
+        enabled_clouds: List of cloud providers with valid credentials
+            (e.g. ``["AWS", "GCP"]``).
+        target_cloud_ready: Whether the specific target cloud (if requested)
+            has valid credentials. None if no target cloud was specified.
+        target_cloud: The target cloud that was checked (empty if none).
+    """
+
+    sky_installed: bool
+    enabled_clouds: list[str]
+    target_cloud_ready: bool | None
+    target_cloud: str
+
+
 class PreFlightCheckResponse(TypedDict):
     """Response from pre_flight_check tool.
 
@@ -128,6 +146,7 @@ class PreFlightCheckResponse(TypedDict):
         hf_authenticated: Whether a valid HuggingFace token was found.
         repo_access: Per-repo access status: "ok", "gated", "not_found", or "error".
         hardware: Detected local hardware and installed packages.
+        cloud_readiness: SkyPilot cloud credential status.
         errors: Issues that will cause the training run to crash.
         warnings: Potential issues that may be fine if targeting a remote cluster.
         paths: Local filesystem paths from the config mapped to whether they exist.
@@ -138,6 +157,7 @@ class PreFlightCheckResponse(TypedDict):
     hf_authenticated: bool
     repo_access: dict[str, str]
     hardware: HardwareInfo
+    cloud_readiness: CloudReadiness
     errors: list[str]
     warnings: list[str]
     paths: dict[str, bool]

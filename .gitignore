@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+src/oumi_mcp_server/__pycache__
 # C extensions
 *.so
 

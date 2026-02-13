@@ -5,6 +5,15 @@ ready-to-use YAML configs for fine-tuning LLMs (Llama, Qwen, Phi, Gemma, etc.).
 
 Jobs are executed locally via ``subprocess.Popen`` (running the Oumi CLI).
 
+⚠️  CRITICAL: WORKING DIRECTORY AND PATHS
+    Jobs run from a different working directory than your project root.
+    - **Config file paths** MUST be absolute (e.g., /home/user/config.yaml)
+    - **Paths inside configs** (dataset_path, output_dir, etc.) should also be
+      absolute, or relative paths will fail with "file not found" errors.
+    - Use absolute paths or expand ~ (which gets converted to absolute).
+    - Relative paths like "data/train.jsonl" will fail unless the job's cwd
+      is set to your project root, which it is not.
+
 GETTING STARTED:
     Call get_started() to see all capabilities and recommended workflow.
 
@@ -14,7 +23,7 @@ TOOLS -- Discovery:
     - search_configs: Find training configs by query, task, or model
     - get_config: Get config details and full YAML content
     - validate_config: Validate configs before running
-    - pre_flight_check: Catch issues before launch (HF auth, hardware, paths)
+    - pre_flight_check: Catch issues before launch (HF auth, hardware, paths, cloud credentials)
     - get_docs: Search Oumi Python API docs (classes, fields, functions)
       for tool discovery and parameter lookup. Supports exact qualified-name
       match, exact short-name match, and relevance-ranked keyword search.
@@ -40,7 +49,7 @@ EXAMPLE WORKFLOW:
     3. search_configs(model="llama3_1", task="sft")                  # Find recipes
     4. get_config("llama3_1/sft/8b_lora", include_content=True)      # Get YAML
     5. validate_config("/path/to/config.yaml", "training")           # Validate
-    6. pre_flight_check("/path/to/config.yaml")                      # Pre-flight
+    6. pre_flight_check("/path/to/config.yaml", cloud="gcp")          # Pre-flight
     7. run_oumi_job("/path/to/config.yaml", "train")                 # Preview (dry-run)
     8. run_oumi_job("/path/to/config.yaml", "train", confirm=True, user_confirmation="EXECUTE")  # Execute
     9. get_job_status("train_20260206_...")                           # Status snapshot
@@ -128,6 +137,7 @@ from oumi_mcp_server.job_service import (
 )
 from oumi_mcp_server.models import (
     CategoriesResponse,
+    CloudReadiness,
     ConfigDetail,
     ConfigMetadata,
     DocsSearchResponse,
@@ -434,16 +444,20 @@ TASK_MAPPING = {
 
 
 @mcp.tool()
-def pre_flight_check(config: str) -> PreFlightCheckResponse:
-    """Run pre-flight checks on a config to catch issues before launching training.
+def pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
+    """Run pre-flight checks on a config to catch issues before launching.
 
-    Validates three areas and returns errors (will crash) vs warnings (may be
+    Validates four areas and returns errors (will crash) vs warnings (may be
     fine if you are configuring locally but targeting a remote GPU cluster):
 
     1. HuggingFace auth — token validity and gated model/dataset access.
     2. Hardware — missing packages (flash-attn, bitsandbytes, deepspeed),
        torch version requirements, GPU presence, and compute capability.
     3. Paths — whether local directories referenced in the config exist.
+    4. Cloud readiness — SkyPilot installation and cloud credential
+       validation. Performs actual API calls to verify credentials (not just
+       file existence). When ``cloud`` is specified, also validates that the
+       target cloud provider is ready.
 
     IMPORTANT: When the response has `blocking=True`, there are hard blockers
     that WILL prevent the run from succeeding. You MUST surface these to the
@@ -452,6 +466,9 @@ def pre_flight_check(config: str) -> PreFlightCheckResponse:
 
     Args:
         config: Absolute path to the YAML config file.
+        cloud: Optional cloud provider to target (e.g. "gcp", "aws", "azure",
+               "lambda"). When provided, validates that credentials for this
+               cloud are configured and working. Leave empty for local runs.
 
     Returns:
         PreFlightCheckResponse with:
@@ -461,18 +478,20 @@ def pre_flight_check(config: str) -> PreFlightCheckResponse:
         - hf_authenticated: True if a valid HuggingFace token was found.
         - repo_access: Per-repo status — "ok", "gated", "not_found", or "error".
         - hardware: Detected accelerator, GPU info, and installed package versions.
+        - cloud_readiness: SkyPilot status — which clouds have valid credentials,
+          and whether the target cloud (if specified) is ready.
         - errors: Issues that will cause the run to crash (missing packages, etc.).
         - warnings: Issues that may be fine for remote clusters (no local GPU, etc.).
         - paths: Local paths from the config mapped to whether they exist.
 
     Examples:
         - pre_flight_check("/home/user/train.yaml")
-        - pre_flight_check("/workspace/configs/llama3_sft.yaml")
+        - pre_flight_check("/home/user/train.yaml", cloud="gcp")
     """
-    return _pre_flight_check(config)
+    return _pre_flight_check(config, cloud=cloud)
 
 
-def _pre_flight_check(config: str) -> PreFlightCheckResponse:
+def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
     """Run pre-flight checks (internal implementation)."""
     errors: list[str] = []
     warnings: list[str] = []
@@ -487,6 +506,7 @@ def _pre_flight_check(config: str) -> PreFlightCheckResponse:
             "hf_authenticated": False,
             "repo_access": {},
             "hardware": _empty_hardware(),
+            "cloud_readiness": _empty_cloud_readiness(),
             "errors": errors,
             "warnings": [],
             "paths": {},
@@ -503,6 +523,7 @@ def _pre_flight_check(config: str) -> PreFlightCheckResponse:
             "hf_authenticated": False,
             "repo_access": {},
             "hardware": _empty_hardware(),
+            "cloud_readiness": _empty_cloud_readiness(),
             "errors": errors,
             "warnings": [],
             "paths": {},
@@ -559,6 +580,13 @@ def _pre_flight_check(config: str) -> PreFlightCheckResponse:
     errors.extend(hw_errors)
     warnings.extend(hw_warnings)
 
+    target_cloud = cloud if cloud and cloud != "local" else ""
+    cloud_errors, cloud_warnings, cloud_readiness = check_cloud_readiness(
+        target_cloud=target_cloud,
+    )
+    errors.extend(cloud_errors)
+    warnings.extend(cloud_warnings)
+
     is_blocking = len(errors) > 0
     if is_blocking:
         summary = (
@@ -578,6 +606,7 @@ def _pre_flight_check(config: str) -> PreFlightCheckResponse:
         "hf_authenticated": hf_authenticated,
         "repo_access": repo_access,
         "hardware": hardware,
+        "cloud_readiness": cloud_readiness,
         "errors": errors,
         "warnings": warnings,
         "paths": validate_paths(cfg, config_path.parent),
@@ -660,6 +689,208 @@ def _empty_hardware() -> HardwareInfo:
         "cuda_version": None,
         "packages": {},
     }
+
+
+def _empty_cloud_readiness() -> CloudReadiness:
+    """Return a default CloudReadiness with nothing checked."""
+    return {
+        "sky_installed": False,
+        "enabled_clouds": [],
+        "target_cloud_ready": None,
+        "target_cloud": "",
+    }
+
+
+def _skypilot_version_label() -> str:
+    """Return a short, user-facing SkyPilot version label."""
+    version = get_package_version("skypilot") or get_package_version("sky")
+    return f"skypilot={version}" if version else "skypilot=unknown"
+
+
+def _compat_warning(message: str) -> str:
+    """Format a version-aware SkyPilot compatibility warning."""
+    return f"SkyPilot API compatibility issue ({_skypilot_version_label()}): {message}"
+
+
+def _compat_error(message: str) -> str:
+    """Format a version-aware SkyPilot compatibility error."""
+    return f"SkyPilot API compatibility error ({_skypilot_version_label()}): {message}"
+
+
+def _cloud_names(values: list[Any]) -> list[str]:
+    """Normalize SkyPilot cloud objects/strings to canonical cloud names."""
+    names: list[str] = []
+    for value in values:
+        name = str(value).strip()
+        if name:
+            names.append(name.upper())
+    return sorted(set(names))
+
+
+def _get_compute_capability(sky: Any) -> Any:
+    """Return SkyPilot compute capability enum value."""
+    try:
+        from sky.clouds.cloud import CloudCapability
+
+        return CloudCapability.COMPUTE
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not resolve CloudCapability.COMPUTE from SkyPilot."
+        ) from exc
+
+
+def _get_enabled_clouds(sky: Any, sky_check: Any) -> list[Any]:
+    """Return enabled clouds using SkyPilot's old/new check API variants."""
+    get_enabled = getattr(sky_check, "get_cached_enabled_clouds_or_refresh", None)
+    if not callable(get_enabled):
+        raise RuntimeError(
+            "sky.check.get_cached_enabled_clouds_or_refresh() is unavailable."
+        )
+    try:
+        return list(get_enabled())
+    except TypeError as exc:
+        if "capability" not in str(exc):
+            raise
+        capability = _get_compute_capability(sky)
+        return list(get_enabled(capability))
+
+
+def _target_cloud_ready(
+    sky: Any,
+    sky_check: Any,
+    *,
+    target_cloud: str,
+    enabled_clouds: list[str],
+) -> bool:
+    """Check if a target cloud is ready across SkyPilot API versions."""
+    target_name = target_cloud.upper()
+    if target_name in enabled_clouds:
+        return True
+
+    check_capability = getattr(sky_check, "check_capability", None)
+    if callable(check_capability):
+        capability = _get_compute_capability(sky)
+        try:
+            status = check_capability(capability, quiet=True, clouds=[target_cloud])
+        except TypeError:
+            status = check_capability(capability, clouds=[target_cloud])
+        if isinstance(status, dict):
+            ready_clouds: list[str] = []
+            for cloud_list in status.values():
+                if isinstance(cloud_list, list):
+                    ready_clouds.extend(str(cloud).upper() for cloud in cloud_list)
+            return target_name in ready_clouds
+        return False
+
+    # Legacy fallback for older SkyPilot APIs.
+    check_one_cloud = getattr(sky_check, "check_one_cloud", None)
+    if callable(check_one_cloud):
+        cloud_obj = sky.CLOUD_REGISTRY.from_str(target_cloud)  # type: ignore[attr-defined]
+        return bool(check_one_cloud(cloud_obj))
+
+    raise RuntimeError(
+        "No supported targeted cloud check API found "
+        "(expected sky.check.check_capability or sky.check.check_one_cloud)."
+    )
+
+
+def check_cloud_readiness(
+    target_cloud: str = "",
+) -> tuple[list[str], list[str], CloudReadiness]:
+    """Check SkyPilot cloud credentials and readiness.
+
+    Uses SkyPilot's cloud-check APIs to discover which clouds have valid
+    credentials (uses cache, refreshes if needed).
+
+    If *target_cloud* is provided (e.g. ``"gcp"``), additionally validates
+    that specific cloud via supported SkyPilot targeted check APIs and reports
+    a blocking error if credentials are invalid.
+
+    Returns ``(errors, warnings, cloud_readiness)``.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    result = _empty_cloud_readiness()
+
+    try:
+        import sky
+        from sky import check as sky_check  # noqa: F401
+
+        result["sky_installed"] = True
+    except ImportError:
+        result["sky_installed"] = False
+        if target_cloud:
+            errors.append(
+                "SkyPilot (sky) is not installed. "
+                "Install it with: pip install 'skypilot-nightly[all]'"
+            )
+        return errors, warnings, result
+
+    # Broad check: get all enabled clouds (uses cache, refreshes if empty).
+    try:
+        enabled = _get_enabled_clouds(sky, sky_check)
+    except RuntimeError as exc:
+        # SkyPilot may raise RuntimeError when no clouds are enabled. Treat
+        # those as non-blocking for broad checks; treat other runtime failures
+        # as compatibility errors.
+        msg = str(exc).lower()
+        if "no cloud access" in msg or "no enabled cloud" in msg:
+            enabled = []
+        else:
+            if target_cloud:
+                errors.append(_compat_error(f"Target cloud check failed: {exc}"))
+                result["target_cloud"] = target_cloud
+                result["target_cloud_ready"] = False
+            else:
+                warnings.append(
+                    _compat_warning(f"Failed to check cloud credentials: {exc}")
+                )
+            return errors, warnings, result
+    except Exception as exc:
+        message = _compat_warning(f"Failed to check cloud credentials: {exc}")
+        if target_cloud:
+            errors.append(_compat_error(f"Target cloud check failed: {exc}"))
+            result["target_cloud"] = target_cloud
+            result["target_cloud_ready"] = False
+        else:
+            warnings.append(message)
+        return errors, warnings, result
+
+    enabled_names = _cloud_names(enabled)
+    result["enabled_clouds"] = enabled_names
+
+    # Targeted check: validate the specific cloud the user wants to use
+    if target_cloud:
+        result["target_cloud"] = target_cloud
+        try:
+            ok = _target_cloud_ready(
+                sky,
+                sky_check,
+                target_cloud=target_cloud,
+                enabled_clouds=enabled_names,
+            )
+        except Exception as exc:
+            result["target_cloud_ready"] = False
+            errors.append(_compat_error(f"Target cloud check failed: {exc}"))
+            return errors, warnings, result
+
+        if ok:
+            result["target_cloud_ready"] = True
+        else:
+            result["target_cloud_ready"] = False
+            errors.append(
+                f"Cloud '{target_cloud}' is not ready. "
+                f"Enabled clouds: {enabled_names}. "
+                "Run 'sky check' for setup instructions."
+            )
+
+    if not enabled_names:
+        warnings.append(
+            "No cloud providers have valid credentials. "
+            "Run 'sky check' to configure cloud access."
+        )
+
+    return errors, warnings, result
 
 
 def check_hardware(cfg: dict) -> tuple[list[str], list[str], HardwareInfo]:
@@ -828,7 +1059,7 @@ def get_started() -> str:
 | `search_configs(query, task, model, keyword)` | Find training configs | `search_configs(model="llama3_1", task="sft")` |
 | `get_config(path, include_content)` | Get config details/YAML | `get_config("llama3_1/sft/8b_lora", include_content=True)` |
 | `validate_config(config, task_type)` | Validate before training | `validate_config("/path/to/config.yaml", "training")` |
-| `pre_flight_check(config)` | Catch issues before launch (HF auth, hardware, paths) | `pre_flight_check("/path/to/config.yaml")` |
+| `pre_flight_check(config, cloud)` | Catch issues before launch (HF auth, hardware, paths, cloud credentials) | `pre_flight_check("/path/to/config.yaml", cloud="gcp")` |
 | `get_docs(query, module, kind)` | Search Oumi Python API docs | `get_docs(["TrainingConfig"])` |
 | `list_modules()` | List indexed API modules | `list_modules()` |
 
@@ -860,14 +1091,26 @@ def get_started() -> str:
 | `jobs://completed` | Recently finished jobs (JSON array) |
 | `jobs://{job_id}/logs` | Full log output for a specific job |
 
+## ⚠️  CRITICAL: Working Directory and Paths
+
+**Jobs run from a different working directory than your project root.**
+- **Config file path**: MUST be absolute (e.g., `/home/user/config.yaml` or `~/my_config.yaml`)
+- **Paths inside config**: Also use absolute paths (dataset_path, output_dir, validation_path, etc.)
+  - ❌ BAD: `dataset_path: pubmedqa/train.jsonl` → will fail with "file not found"
+  - ✅ GOOD: `dataset_path: /home/user/data/pubmedqa/train.jsonl`
+  - ✅ GOOD: `dataset_path: ~/data/pubmedqa/train.jsonl` (~ is expanded)
+
+If you get "file not found" errors during job execution, check your paths!
+
 ## Quickstart Workflow
 
 1. **Discover models**: `list_categories()` -> see model_families
 2. **Find recipes**: `search_configs(model="llama3_1", task="sft")`
 3. **Get YAML**: `get_config("llama3_1/sft/8b_lora", include_content=True)`
 4. **Customize**: Modify model_name, datasets, output_dir for your use case
+   - **Use absolute paths** for any file/directory references
 5. **Validate**: `validate_config("/your/config.yaml", "training")`
-6. **Pre-flight**: `pre_flight_check("/your/config.yaml")` -> verify HF auth, hardware, paths
+6. **Pre-flight**: `pre_flight_check("/your/config.yaml", cloud="gcp")` -> verify HF auth, hardware, paths, cloud credentials
 7. **Preview**: `run_oumi_job("/your/config.yaml", "train")` -> dry-run (default)
 8. **Execute**: `run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")`
 9. **Check status**: `get_job_status("train_20260206_...")` -> single snapshot
@@ -945,6 +1188,12 @@ async def run_oumi_job(
 
     Args:
         config_path: Absolute path to a validated Oumi YAML config file.
+                     IMPORTANT: Must be absolute (e.g., /home/user/config.yaml)
+                     or expanded with ~ (e.g., ~/my_config.yaml).
+                     Relative paths will be rejected.
+                     **Also ensure paths inside the config (dataset_path, output_dir, etc.)
+                     are absolute**, since the job runs from a different working
+                     directory than your project root.
         command: Which Oumi subcommand to run.  One of:
             train, analyze, synth, evaluate, eval, infer, tune, quantize.
         dry_run: If True (default), validate and return an execution plan
@@ -1083,11 +1332,16 @@ async def run_oumi_job(
     preflight_warnings: list[str] = []
 
     if cloud != "local":
-        preflight = _pre_flight_check(abs_config)
+        preflight = _pre_flight_check(abs_config, cloud=cloud)
         preflight_summary = preflight.get("summary", "")
         preflight_blocking = bool(preflight.get("blocking"))
         preflight_errors = preflight.get("errors", []) or []
         preflight_warnings = preflight.get("warnings", []) or []
+        compat_messages = [
+            msg
+            for msg in [*preflight_errors, *preflight_warnings]
+            if "SkyPilot API compatibility" in msg
+        ]
         if preflight_blocking:
             return _error_response(
                 f"Pre-flight checks failed: {preflight_summary}",
@@ -1098,6 +1352,20 @@ async def run_oumi_job(
                 output_dir=output_dir,
                 preflight_summary=preflight_summary,
                 preflight_blocking=preflight_blocking,
+                preflight_errors=preflight_errors,
+                preflight_warnings=preflight_warnings,
+            )
+        if compat_messages:
+            return _error_response(
+                "Pre-flight detected a SkyPilot compatibility issue. "
+                "Align Oumi/SkyPilot versions and run `sky check` before launching.",
+                status="blocked",
+                job_id=job_id,
+                config_path=abs_config,
+                model_name=model_name,
+                output_dir=output_dir,
+                preflight_summary=preflight_summary,
+                preflight_blocking=True,
                 preflight_errors=preflight_errors,
                 preflight_warnings=preflight_warnings,
             )
