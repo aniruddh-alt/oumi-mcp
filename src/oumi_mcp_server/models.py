@@ -2,7 +2,7 @@
 
 from typing import NotRequired, TypedDict
 
-from oumi_mcp_server.constants import PeftType, TaskType
+from oumi_mcp_server.constants import TaskType
 
 
 class ConfigMetadata(TypedDict):
@@ -24,7 +24,7 @@ class ConfigMetadata(TypedDict):
     task_type: TaskType
     datasets: list[str]
     reward_functions: list[str]
-    peft_type: str  # "lora", "qlora", or "" for full fine-tuning
+    peft_type: str
 
 
 class KeySettings(TypedDict):
@@ -116,6 +116,24 @@ class HardwareInfo(TypedDict):
     packages: dict[str, str]
 
 
+class CloudReadiness(TypedDict):
+    """Cloud credential and readiness status from SkyPilot.
+
+    Attributes:
+        sky_installed: Whether the ``sky`` (SkyPilot) package is importable.
+        enabled_clouds: List of cloud providers with valid credentials
+            (e.g. ``["AWS", "GCP"]``).
+        target_cloud_ready: Whether the specific target cloud (if requested)
+            has valid credentials. None if no target cloud was specified.
+        target_cloud: The target cloud that was checked (empty if none).
+    """
+
+    sky_installed: bool
+    enabled_clouds: list[str]
+    target_cloud_ready: bool | None
+    target_cloud: str
+
+
 class PreFlightCheckResponse(TypedDict):
     """Response from pre_flight_check tool.
 
@@ -128,6 +146,7 @@ class PreFlightCheckResponse(TypedDict):
         hf_authenticated: Whether a valid HuggingFace token was found.
         repo_access: Per-repo access status: "ok", "gated", "not_found", or "error".
         hardware: Detected local hardware and installed packages.
+        cloud_readiness: SkyPilot cloud credential status.
         errors: Issues that will cause the training run to crash.
         warnings: Potential issues that may be fine if targeting a remote cluster.
         paths: Local filesystem paths from the config mapped to whether they exist.
@@ -138,6 +157,7 @@ class PreFlightCheckResponse(TypedDict):
     hf_authenticated: bool
     repo_access: dict[str, str]
     hardware: HardwareInfo
+    cloud_readiness: CloudReadiness
     errors: list[str]
     warnings: list[str]
     paths: dict[str, bool]
@@ -161,6 +181,13 @@ class JobSubmissionResponse(TypedDict):
         output_dir: Output directory extracted from config.
         message: Human-readable summary of what happened or will happen.
         error: Error message if success is False.
+        launch_confirmed: True if the launch was confirmed (cloud only).
+        preflight_summary: One-line pre-flight verdict (cloud only).
+        preflight_blocking: True if pre-flight found blocking issues.
+        preflight_errors: List of blocking issues from pre-flight.
+        preflight_warnings: List of warnings from pre-flight.
+        oumi_job_id: Job ID on the cluster (if known at submit time).
+        cluster: Cluster name (if known at submit time).
     """
 
     success: bool
@@ -175,6 +202,13 @@ class JobSubmissionResponse(TypedDict):
     output_dir: str
     message: str
     error: NotRequired[str]
+    launch_confirmed: NotRequired[bool]
+    preflight_summary: NotRequired[str]
+    preflight_blocking: NotRequired[bool]
+    preflight_errors: NotRequired[list[str]]
+    preflight_warnings: NotRequired[list[str]]
+    oumi_job_id: NotRequired[str]
+    cluster: NotRequired[str]
 
 
 class JobStatusResponse(TypedDict):
@@ -269,3 +303,107 @@ class JobLogsResponse(TypedDict):
     log_file: str
     logs: str
     error: str | None
+
+
+class FieldDoc(TypedDict):
+    """Documentation for a single dataclass field.
+
+    Attributes:
+        name: Field name.
+        type_str: String representation of the field type.
+        description: Docstring extracted from AST (string literal after assignment).
+        default: String representation of the default value, or "" if required.
+    """
+
+    name: str
+    type_str: str
+    description: str
+    default: str
+
+
+class DocstringSection(TypedDict):
+    """A named section from a parsed Google-style docstring.
+
+    Attributes:
+        name: Section header (e.g. "Args", "Returns", "Raises").
+        content: Full text content of the section.
+    """
+
+    name: str
+    content: str
+
+
+class DocEntry(TypedDict):
+    """A single indexed documentation entry (class, function, or method).
+
+    Attributes:
+        qualified_name: Fully qualified name (e.g. "oumi.core.configs.TrainingConfig").
+        name: Short name (e.g. "TrainingConfig").
+        kind: Entry kind: "class", "dataclass", "function", or "method".
+        module: Module path (e.g. "oumi.core.configs").
+        summary: First line/paragraph of the docstring.
+        sections: Parsed docstring sections (Args, Returns, etc.).
+        fields: Dataclass field documentation (empty for non-dataclasses).
+        signature: Function/method signature string.
+        parent_class: Parent class name for methods, "" otherwise.
+    """
+
+    qualified_name: str
+    name: str
+    kind: str
+    module: str
+    summary: str
+    sections: list[DocstringSection]
+    fields: list[FieldDoc]
+    signature: str
+    parent_class: str
+
+
+class DocsSearchResponse(TypedDict):
+    """Response from the get_docs tool.
+
+    Attributes:
+        results: Matching documentation entries.
+        query: The normalized query terms used for this search.
+        total_matches: Total number of matches before limiting.
+        index_ready: Whether background indexing has completed.
+        error: Error message, or "" if no error.
+    """
+
+    results: list[DocEntry]
+    query: list[str]
+    total_matches: int
+    index_ready: bool
+    error: str
+
+
+class ModuleInfo(TypedDict):
+    """Summary information for an indexed module.
+
+    Attributes:
+        module: Fully qualified module path.
+        description: Human-readable description of the module.
+        class_count: Number of classes indexed from this module.
+        function_count: Number of module-level functions indexed.
+        class_names: Names of classes found in the module.
+    """
+
+    module: str
+    description: str
+    class_count: int
+    function_count: int
+    class_names: list[str]
+
+
+class ListModulesResponse(TypedDict):
+    """Response from the list_modules tool.
+
+    Attributes:
+        modules: Per-module summaries.
+        total_entries: Total number of indexed documentation entries.
+        index_ready: Whether background indexing has completed.
+    """
+
+    modules: list[ModuleInfo]
+    total_entries: int
+    index_ready: bool

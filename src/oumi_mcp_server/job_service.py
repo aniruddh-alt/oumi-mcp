@@ -37,6 +37,7 @@ from oumi_mcp_server.constants import (
     LOG_TAIL_INTERVAL_SECONDS,
     MAX_COMPLETED_JOBS,
 )
+from oumi_mcp_server.models import JobCancelResponse
 
 logger = logging.getLogger(__name__)
 
@@ -426,7 +427,7 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
     return record.oumi_status
 
 
-async def cancel(record: JobRecord, *, force: bool = False) -> dict[str, Any]:
+async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse:
     """Cancel a job.
 
     For **local** jobs, sends SIGTERM (or SIGKILL if *force* is True)
