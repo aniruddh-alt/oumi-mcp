@@ -1,6 +1,6 @@
 """TypedDict models for Oumi MCP server data structures."""
 
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from oumi_mcp_server.constants import TaskType
 
@@ -71,27 +71,20 @@ class CategoriesResponse(TypedDict):
         model_families: Available model families in recipes/.
         api_providers: Available API providers in apis/.
         total_configs: Total number of configs available.
+        oumi_version: Installed oumi library version.
+        configs_source: Where configs are loaded from (e.g. "cache:0.7",
+            "cache:main", "bundled:0.7", "env:/path").
+        version_warning: Non-empty when configs may be mismatched with the
+            installed library version.
     """
 
     categories: list[str]
     model_families: list[str]
     api_providers: list[str]
     total_configs: int
-
-
-class SearchResult(TypedDict):
-    """Result item from search_configs tool.
-
-    This is an alias for ConfigMetadata for clarity in tool responses.
-    """
-
-    path: str
-    description: str
-    model_name: str
-    task_type: TaskType
-    datasets: list[str]
-    reward_functions: list[str]
-    peft_type: str  # "lora", "qlora", or "" for full fine-tuning
+    oumi_version: str
+    configs_source: str
+    version_warning: str
 
 
 class HardwareInfo(TypedDict):
@@ -188,6 +181,13 @@ class JobSubmissionResponse(TypedDict):
         preflight_warnings: List of warnings from pre-flight.
         oumi_job_id: Job ID on the cluster (if known at submit time).
         cluster: Cluster name (if known at submit time).
+        launch_state: Lifecycle stage from MCP launcher state machine.
+        cancel_requested: Whether cancellation intent is currently recorded.
+        launch_started_at: ISO timestamp when launch began.
+        launch_finished_at: ISO timestamp when launch finished.
+        launch_attempts: Number of launch attempts for this record.
+        launcher_error_type: Exception type captured during launch failure.
+        staged_config_path: Staged config path used for cloud portability.
     """
 
     success: bool
@@ -209,6 +209,13 @@ class JobSubmissionResponse(TypedDict):
     preflight_warnings: NotRequired[list[str]]
     oumi_job_id: NotRequired[str]
     cluster: NotRequired[str]
+    launch_state: NotRequired[str]
+    cancel_requested: NotRequired[bool]
+    launch_started_at: NotRequired[str]
+    launch_finished_at: NotRequired[str]
+    launch_attempts: NotRequired[int]
+    launcher_error_type: NotRequired[str]
+    staged_config_path: NotRequired[str]
 
 
 class JobStatusResponse(TypedDict):
@@ -229,6 +236,13 @@ class JobStatusResponse(TypedDict):
         metadata: Additional metadata from the launcher.
         log_file: Absolute path to the full stdout log file on disk (if available).
         error: Error message if the job failed or lookup failed.
+        launch_state: Lifecycle stage from MCP launcher state machine.
+        cancel_requested: Whether cancellation intent is currently recorded.
+        launch_started_at: ISO timestamp when launch began.
+        launch_finished_at: ISO timestamp when launch finished.
+        launch_attempts: Number of launch attempts for this record.
+        launcher_error_type: Exception type captured during launch failure.
+        staged_config_path: Staged config path used for cloud portability.
     """
 
     success: bool
@@ -242,8 +256,15 @@ class JobStatusResponse(TypedDict):
     cluster: str
     model_name: str
     is_done: bool
-    metadata: NotRequired[str]
+    metadata: NotRequired[dict[str, Any]]
     log_file: NotRequired[str]
+    launch_state: NotRequired[str]
+    cancel_requested: NotRequired[bool]
+    launch_started_at: NotRequired[str]
+    launch_finished_at: NotRequired[str]
+    launch_attempts: NotRequired[int]
+    launcher_error_type: NotRequired[str]
+    staged_config_path: NotRequired[str]
     error: str | None
 
 
@@ -367,6 +388,7 @@ class DocsSearchResponse(TypedDict):
         query: The normalized query terms used for this search.
         total_matches: Total number of matches before limiting.
         index_ready: Whether background indexing has completed.
+        oumi_version: Version of the installed oumi library the docs reflect.
         error: Error message, or "" if no error.
     """
 
@@ -374,6 +396,7 @@ class DocsSearchResponse(TypedDict):
     query: list[str]
     total_matches: int
     index_ready: bool
+    oumi_version: str
     error: str
 
 
@@ -402,8 +425,10 @@ class ListModulesResponse(TypedDict):
         modules: Per-module summaries.
         total_entries: Total number of indexed documentation entries.
         index_ready: Whether background indexing has completed.
+        oumi_version: Version of the installed oumi library the docs reflect.
     """
 
     modules: list[ModuleInfo]
     total_entries: int
     index_ready: bool
+    oumi_version: str

@@ -3,6 +3,10 @@
 Dynamically imports and introspects Oumi modules at startup, building an
 in-memory index of classes, dataclass fields, functions, and methods.
 Provides keyword search and exact-name lookup for LLM agents.
+
+Modules are auto-discovered via ``pkgutil.walk_packages`` rather than a
+hardcoded list, so the index automatically picks up new modules when the
+installed oumi version changes.
 """
 
 import ast
@@ -11,6 +15,7 @@ import heapq
 import importlib
 import inspect
 import logging
+import pkgutil
 import re
 import textwrap
 import threading
@@ -20,7 +25,9 @@ from typing import Any
 from oumi_mcp_server.constants import (
     DOCS_MAX_METHODS_PER_CLASS,
     DOCS_MAX_RESULTS,
-    DOCS_MODULES,
+    DOCS_MODULE_DENYLIST,
+    DOCS_MODULE_DENYLIST_PREFIXES,
+    DOCS_MODULE_DESCRIPTIONS,
 )
 from oumi_mcp_server.models import (
     DocEntry,
@@ -32,6 +39,17 @@ from oumi_mcp_server.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_oumi_version() -> str:
+    """Return the installed oumi package version, or "unknown"."""
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("oumi")
+    except Exception:
+        return "unknown"
+
 
 _index: list[DocEntry] = []
 _module_info: list[ModuleInfo] = []
@@ -341,10 +359,67 @@ def _index_module(
     return (entries, info)
 
 
-def build_index() -> None:
-    """Build the full documentation index from DOCS_MODULES.
+def discover_oumi_modules() -> list[tuple[str, str]]:
+    """Auto-discover all public oumi modules and pair with descriptions.
 
-    Iterates over all configured modules, imports them, and builds the index.
+    Uses ``pkgutil.walk_packages`` to find every importable ``oumi.*``
+    submodule, filters out private/test/denylisted modules, and merges
+    curated descriptions from ``DOCS_MODULE_DESCRIPTIONS``.
+
+    Returns:
+        List of ``(module_path, description)`` tuples.
+    """
+    try:
+        import oumi
+    except ImportError:
+        logger.warning("oumi package not importable; falling back to curated list")
+        return list(DOCS_MODULE_DESCRIPTIONS.items())
+
+    modules: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for _importer, modname, _ispkg in pkgutil.walk_packages(
+        oumi.__path__, prefix="oumi."
+    ):
+        parts = modname.split(".")
+        if any(part.startswith("_") for part in parts[1:]):
+            continue
+        if ".tests." in modname or modname.endswith(".tests"):
+            continue
+        if modname in DOCS_MODULE_DENYLIST:
+            continue
+        if any(modname.startswith(prefix) for prefix in DOCS_MODULE_DENYLIST_PREFIXES):
+            continue
+        if modname in seen:
+            continue
+        seen.add(modname)
+
+        description = DOCS_MODULE_DESCRIPTIONS.get(modname, "")
+        modules.append((modname, description))
+
+    if not modules:
+        logger.warning("Auto-discovery found 0 modules; falling back to curated list")
+        return list(DOCS_MODULE_DESCRIPTIONS.items())
+
+    logger.info("Auto-discovered %d oumi modules", len(modules))
+    return sorted(modules, key=lambda t: t[0])
+
+
+def _module_docstring_summary(mod: object) -> str:
+    """Extract the first sentence of a module's docstring."""
+    doc = getattr(mod, "__doc__", None)
+    if not doc:
+        return ""
+    first_line = doc.strip().split("\n")[0].strip().rstrip(".")
+    if len(first_line) > 120:
+        first_line = first_line[:117] + "..."
+    return first_line
+
+
+def build_index() -> None:
+    """Build the full documentation index by auto-discovering oumi modules.
+
+    Iterates over all discovered modules, imports them, and builds the index.
     Sets ``_index_ready`` when complete. Safe to call from any thread.
     """
     global _index, _module_info, _qualified_name_map, _name_lower_map, _search_blobs
@@ -352,23 +427,26 @@ def build_index() -> None:
     all_entries: list[DocEntry] = []
     all_info: list[ModuleInfo] = []
 
-    for module_path, description in DOCS_MODULES:
+    discovered_modules = discover_oumi_modules()
+
+    for module_path, description in discovered_modules:
         logger.info("Indexing docs: %s", module_path)
         try:
             entries, info = _index_module(module_path, description)
+            if not description and info["class_count"] + info["function_count"] > 0:
+                try:
+                    mod = importlib.import_module(module_path)
+                    auto_desc = _module_docstring_summary(mod)
+                    if auto_desc:
+                        info["description"] = auto_desc
+                except Exception:
+                    pass
+            if info["class_count"] + info["function_count"] == 0:
+                continue
             all_entries.extend(entries)
             all_info.append(info)
         except Exception as exc:
             logger.error("Error indexing %s: %s", module_path, exc, exc_info=True)
-            all_info.append(
-                {
-                    "module": module_path,
-                    "description": description,
-                    "class_count": 0,
-                    "function_count": 0,
-                    "class_names": [],
-                }
-            )
 
     qualified_name_map: dict[str, list[DocEntry]] = defaultdict(list)
     name_lower_map: dict[str, list[DocEntry]] = defaultdict(list)
@@ -567,6 +645,7 @@ def search_docs(
         "query": query_terms,
         "total_matches": total_matches,
         "index_ready": is_ready,
+        "oumi_version": _get_oumi_version(),
         "error": error_msg,
     }
 
@@ -615,4 +694,5 @@ def get_module_list() -> ListModulesResponse:
         "modules": info,
         "total_entries": total,
         "index_ready": is_ready,
+        "oumi_version": _get_oumi_version(),
     }

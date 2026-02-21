@@ -1,5 +1,6 @@
 """Configuration service for parsing and managing Oumi YAML configs."""
 
+import copy
 import logging
 import os
 from functools import lru_cache
@@ -76,6 +77,16 @@ def get_configs_dir() -> Path:
 
 
 @lru_cache(maxsize=YAML_CACHE_SIZE)
+def _parse_yaml_cached(path: str) -> dict[str, Any]:
+    """Parse a YAML file (cached, internal). Callers should use parse_yaml()."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"Failed to parse YAML {path}: {e}")
+        return {}
+
+
 def parse_yaml(path: str) -> dict[str, Any]:
     """Parse a YAML file, returning empty dict on error.
 
@@ -85,12 +96,7 @@ def parse_yaml(path: str) -> dict[str, Any]:
     Returns:
         Parsed YAML as dict, or empty dict if parsing fails.
     """
-    try:
-        with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception as e:
-        logger.warning(f"Failed to parse YAML {path}: {e}")
-        return {}
+    return copy.deepcopy(_parse_yaml_cached(path))
 
 
 def extract_header_comment(path: Path) -> str:
@@ -200,7 +206,9 @@ def determine_peft_type(config: dict[str, Any], path: str) -> PeftType | None:
     """
     peft = config.get("peft", {})
     if peft.get("lora_r"):
-        return "qlora" if "qlora" in path.lower() else "lora"
+        if peft.get("q_lora") or "qlora" in path.lower():
+            return "qlora"
+        return "lora"
     return None
 
 
@@ -232,12 +240,8 @@ def build_metadata(config_path: Path, configs_dir: Path) -> ConfigMetadata:
 
 
 @lru_cache(maxsize=CONFIGS_CACHE_SIZE)
-def get_all_configs() -> list[ConfigMetadata]:
-    """Get metadata for all configs (cached).
-
-    Returns:
-        List of ConfigMetadata for all YAML files in configs directory.
-    """
+def _get_all_configs_cached() -> list[ConfigMetadata]:
+    """Get metadata for all configs (cached, internal)."""
     configs_dir = get_configs_dir()
     configs: list[ConfigMetadata] = []
 
@@ -245,6 +249,15 @@ def get_all_configs() -> list[ConfigMetadata]:
         configs.append(build_metadata(path, configs_dir))
 
     return configs
+
+
+def get_all_configs() -> list[ConfigMetadata]:
+    """Get metadata for all configs (cached).
+
+    Returns:
+        List of ConfigMetadata for all YAML files in configs directory.
+    """
+    return copy.deepcopy(_get_all_configs_cached())
 
 
 def extract_key_settings(config: dict[str, Any]) -> KeySettings:
@@ -401,4 +414,7 @@ def get_categories(configs_dir: Path, configs_count: int) -> CategoriesResponse:
         "model_families": model_families,
         "api_providers": api_providers,
         "total_configs": configs_count,
+        "oumi_version": "",
+        "configs_source": "",
+        "version_warning": "",
     }
