@@ -1,7 +1,5 @@
-.env.example
 README.md
 pyproject.toml
-docs/mcp_reference.md
 src/oumi_mcp.egg-info/PKG-INFO
 src/oumi_mcp.egg-info/SOURCES.txt
 src/oumi_mcp.egg-info/dependency_links.txt
@@ -12,6 +10,7 @@ src/oumi_mcp_server/__init__.py
 src/oumi_mcp_server/__main__.py
 src/oumi_mcp_server/config_service.py
 src/oumi_mcp_server/constants.py
+src/oumi_mcp_server/docs_service.py
 src/oumi_mcp_server/job_service.py
 src/oumi_mcp_server/models.py
 src/oumi_mcp_server/server.py
@@ -87,9 +86,6 @@ src/oumi_mcp_server/configs/examples/misc/README.md
 src/oumi_mcp_server/configs/examples/misc/dev_gcp_job.yaml
 src/oumi_mcp_server/configs/examples/misc/hello_world_gcp_job.yaml
 src/oumi_mcp_server/configs/examples/misc/hello_world_polaris_job.yaml
-src/oumi_mcp_server/configs/examples/misc/sky_init.sh
-src/oumi_mcp_server/configs/examples/misc/slurm_init.sh
-src/oumi_mcp_server/configs/examples/misc/slurm_ray_init.sh
 src/oumi_mcp_server/configs/examples/misc/tulu3_sft_mini.yaml
 src/oumi_mcp_server/configs/examples/misc/vllm_polaris_job.yaml
 src/oumi_mcp_server/configs/examples/quantization/README.md
@@ -118,8 +114,6 @@ src/oumi_mcp_server/configs/projects/coalm/70b_train.yaml
 src/oumi_mcp_server/configs/projects/coalm/8b_infer.yaml
 src/oumi_mcp_server/configs/projects/coalm/8b_train.yaml
 src/oumi_mcp_server/configs/projects/coalm/README.md
-src/oumi_mcp_server/configs/projects/coalm/images/dataset.png
-src/oumi_mcp_server/configs/projects/coalm/images/results.png
 src/oumi_mcp_server/configs/projects/dcvlr/README.md
 src/oumi_mcp_server/configs/projects/dcvlr/run_image_synthesis.py
 src/oumi_mcp_server/configs/projects/dcvlr/synthesize_images_vllm.py
@@ -129,9 +123,6 @@ src/oumi_mcp_server/configs/projects/dcvlr/starter_kit/qwenvl-openr1.yaml
 src/oumi_mcp_server/configs/projects/halloumi/8b_train.yaml
 src/oumi_mcp_server/configs/projects/halloumi/README.md
 src/oumi_mcp_server/configs/projects/halloumi/gcp_job.yaml
-src/oumi_mcp_server/configs/projects/halloumi/halloumi_classifier_inference_notebook.ipynb
-src/oumi_mcp_server/configs/projects/halloumi/halloumi_eval_notebook.ipynb
-src/oumi_mcp_server/configs/projects/halloumi/halloumi_inference_notebook.ipynb
 src/oumi_mcp_server/configs/projects/judges/code/code_quality.yaml
 src/oumi_mcp_server/configs/projects/judges/code/correctness.yaml
 src/oumi_mcp_server/configs/projects/judges/code/maintainability.yaml
@@ -154,8 +145,6 @@ src/oumi_mcp_server/configs/projects/limo/qwen2.5_7b_fft_yarn_deepspeed_memory_o
 src/oumi_mcp_server/configs/projects/wc50m/README.md
 src/oumi_mcp_server/configs/projects/wc50m/configs/base_ultrachat.yaml
 src/oumi_mcp_server/configs/projects/wc50m/configs/gcp_base_ultrachat.yaml
-src/oumi_mcp_server/configs/projects/wc50m/results/baseline.csv
-src/oumi_mcp_server/configs/projects/wc50m/results/oumi.csv
 src/oumi_mcp_server/configs/recipes/README.md
 src/oumi_mcp_server/configs/recipes/deepseek_r1/README.md
 src/oumi_mcp_server/configs/recipes/deepseek_r1/evaluation/distill_llama_70b/eval.yaml
@@ -551,3 +540,5 @@ src/oumi_mcp_server/configs/recipes/vision/smolvlm/sft/lora/gcp_job.yaml
 src/oumi_mcp_server/configs/recipes/vision/smolvlm/sft/lora/train.yaml
 src/oumi_mcp_server/prompts/__init__.py
 src/oumi_mcp_server/prompts/mle_prompt.py
+tests/test_cloud_readiness.py
+tests/test_job_recovery_and_control.py
