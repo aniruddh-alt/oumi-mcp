@@ -60,6 +60,7 @@ EXAMPLE WORKFLOW:
 import asyncio
 import json
 import logging
+import os
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -161,9 +162,6 @@ from oumi_mcp_server.prompts.mle_prompt import (
     TRAIN_COMMAND_RESOURCE,
 )
 
-
-import os
-
 _CLOUD_ENV_VAR_HINTS: dict[str, str] = {
     "WANDB_API_KEY": "Weights & Biases logging",
     "WANDB_PROJECT": "Weights & Biases project name",
@@ -181,9 +179,9 @@ def _build_missing_env_warning(envs: dict[str, str] | None) -> str:
     if not missing:
         return ""
     return (
-        "\n\nThese env vars exist locally but won't be set on the remote VM:\n"
+        "\n\nWARNING: These env vars exist locally but won't be set on the remote VM:\n"
         + "\n".join(missing)
-        + "\n  Pass them via the `envs` parameter to run_oumi_job."
+        + '\n  Pass them via the `envs` parameter: envs={"WANDB_API_KEY": "..."}'
     )
 
 
@@ -1138,7 +1136,9 @@ def check_hardware(cfg: dict) -> tuple[list[str], list[str], HardwareInfo]:
 
 
 @mcp.tool()
-def validate_config(config: str, task_type: ValidatorTaskType) -> ValidateConfigResponse:
+def validate_config(
+    config: str, task_type: ValidatorTaskType
+) -> ValidateConfigResponse:
     """Validate an Oumi YAML config file against its schema.
 
     Use this to check if a config file is valid before running training,
@@ -1334,7 +1334,9 @@ async def run_oumi_job(
     **Credential propagation:**
     Common credential files (``~/.cache/huggingface/token``, ``~/.netrc``) are
     automatically mounted on the remote VM when they exist locally, so HuggingFace
-    and WandB auth work without manual configuration.
+    and WandB auth work without manual configuration. Environment variables from
+    your local shell are **not** forwarded automatically to cloud jobs; pass them
+    explicitly via ``envs``.
 
     Use ``get_job_status(job_id)`` for a status snapshot.
     Use ``get_job_logs(job_id, lines=...)`` for a bounded log snapshot.
@@ -1547,6 +1549,13 @@ async def run_oumi_job(
             auto_mounts = [
                 c for c in _DEFAULT_CREDENTIAL_FILES if Path(c).expanduser().exists()
             ]
+            effective_envs = envs or {}
+            if effective_envs:
+                dry_run_msg_parts.append(
+                    f"Remote envs: {', '.join(sorted(effective_envs))}"
+                )
+            else:
+                dry_run_msg_parts.append("Remote envs: none (pass via envs={...})")
             if auto_mounts:
                 dry_run_msg_parts.append(f"Auto-mount: {', '.join(auto_mounts)}")
             if num_nodes > 1 or num_gpus_preview > 1:
@@ -1566,19 +1575,19 @@ async def run_oumi_job(
             if env_warning:
                 message = message + env_warning
             message = message + (
-                "\n\nTip: For complex cloud setups (wandb integration, multi-node, "
-                "custom working_dir), write a job config YAML directly:\n"
+                "\n\nTip: For complex cloud setups (wandb, multi-node, custom "
+                "working_dir), consider writing a job config YAML directly:\n"
                 "  resources:\n"
                 f"    cloud: {cloud}\n"
-                "    accelerators: \"A100:4\"\n"
-                "  working_dir: .  # syncs your project to the remote\n"
+                '    accelerators: "A100:4"\n'
+                "  working_dir: /path/to/your/project\n"
                 "  envs:\n"
                 "    WANDB_API_KEY: your-key\n"
                 "  setup: |\n"
-                "    pip install uv && uv pip install --system 'oumi[gpu]'\n"
+                "    pip install oumi[gpu]\n"
                 "  run: |\n"
-                "    oumi train -c configs/path/to/your_config.yaml\n"
-                "Then pass that YAML to run_oumi_job -- it will be used directly."
+                "    oumi train -c configs/my_config.yaml\n"
+                "Then pass that file to run_oumi_job -- it will be used directly."
             )
         return {
             "success": True,
@@ -1627,7 +1636,6 @@ async def run_oumi_job(
         preflight_errors = preflight.get("errors", []) or []
         preflight_warnings = list(preflight.get("warnings", []) or [])
 
-        # --- Cloud-specific pre-flight warnings (Issue 8) ---
         if not is_job_config_file:
             hf_token_path = Path("~/.cache/huggingface/token").expanduser()
             if (
@@ -1639,14 +1647,12 @@ async def run_oumi_job(
                     "Gated model downloads will fail on the remote VM."
                 )
 
-            # Warn if multi-GPU accelerators specified but num_nodes > 1 without setup
             num_gpus_for_check = (
                 int(accelerators.split(":")[-1])
                 if accelerators and ":" in accelerators
                 else (1 if accelerators else 0)
             )
             if (num_gpus_for_check > 1 or num_nodes > 1) and not setup_script:
-                # torchrun will be used automatically — just informational
                 preflight_warnings.append(
                     f"Multi-GPU/multi-node job detected (accelerators={accelerators!r}, "
                     f"num_nodes={num_nodes}). Using `oumi distributed torchrun` automatically."
@@ -1878,7 +1884,11 @@ def _build_status_response(
     }
 
     if status and status.metadata:
-        base["metadata"] = status.metadata if isinstance(status.metadata, dict) else {"raw": str(status.metadata)}
+        base["metadata"] = (
+            status.metadata
+            if isinstance(status.metadata, dict)
+            else {"raw": str(status.metadata)}
+        )
     base["launch_state"] = record.launch_state
     base["cancel_requested"] = record.cancel_requested
     if record.launch_started_at:
@@ -2676,6 +2686,7 @@ def config_sync(force: bool = False) -> dict:
 
         # Invalidate caches so subsequent searches use the new configs
         from oumi_mcp_server.config_service import clear_config_caches
+
         clear_config_caches()
 
         _touch_sync_marker()

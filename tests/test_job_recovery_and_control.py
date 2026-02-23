@@ -39,7 +39,9 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_job_supports_direct_cloud_identity(self) -> None:
         with (
             patch("oumi_mcp_server.server._resolve_job_record", return_value=None),
-            patch("oumi_mcp_server.server.launcher.cancel", return_value=None) as mock_cancel,
+            patch(
+                "oumi_mcp_server.server.launcher.cancel", return_value=None
+            ) as mock_cancel,
         ):
             response = await server.cancel_job(
                 job_id="",
@@ -51,7 +53,9 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["success"])
         mock_cancel.assert_called_once_with("sky-job-123", "gcp", "cluster-a")
 
-    async def test_cancel_job_returns_structured_error_on_launcher_failure(self) -> None:
+    async def test_cancel_job_returns_structured_error_on_launcher_failure(
+        self,
+    ) -> None:
         with (
             patch("oumi_mcp_server.server._resolve_job_record", return_value=None),
             patch(
@@ -69,10 +73,14 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response["success"])
         self.assertIn("Failed to cancel cloud job", response["error"])
 
-    async def test_get_job_status_by_direct_identity_not_found_is_graceful(self) -> None:
+    async def test_get_job_status_by_direct_identity_not_found_is_graceful(
+        self,
+    ) -> None:
         with (
             patch("oumi_mcp_server.server._resolve_job_record", return_value=None),
-            patch("oumi_mcp_server.server._fetch_cloud_status_direct", return_value=None),
+            patch(
+                "oumi_mcp_server.server._fetch_cloud_status_direct", return_value=None
+            ),
         ):
             response = await server.get_job_status(
                 job_id="",
@@ -84,7 +92,9 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response["success"])
         self.assertEqual(response["status"], "not_found")
 
-    async def test_get_job_logs_by_direct_identity_returns_helpful_message(self) -> None:
+    async def test_get_job_logs_by_direct_identity_returns_helpful_message(
+        self,
+    ) -> None:
         with patch("oumi_mcp_server.server._resolve_job_record", return_value=None):
             response = await server.get_job_logs(
                 job_id="",
@@ -104,7 +114,9 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             logging.WARNING,
         )
 
-    async def test_run_oumi_job_blocks_malformed_yaml_at_execution_boundary(self) -> None:
+    async def test_run_oumi_job_blocks_malformed_yaml_at_execution_boundary(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             bad_cfg = Path(tmp_dir) / "bad.yaml"
             bad_cfg.write_text("model: [", encoding="utf-8")
@@ -117,6 +129,25 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(response["success"])
         self.assertIn("Invalid YAML config", response["error"])
+
+    async def test_dry_run_cloud_warns_about_missing_env_vars(self) -> None:
+        """Dry-run for cloud job should warn when local env vars won't be forwarded."""
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = Path(tmp_dir) / "train.yaml"
+            cfg.write_text("model: {model_name: test/model}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
+                response = await server.run_oumi_job(
+                    config_path=str(cfg),
+                    command="train",
+                    cloud="gcp",
+                    dry_run=True,
+                    confirm=False,
+                )
+        self.assertTrue(response["success"])
+        self.assertTrue(response["dry_run"])
+        self.assertIn("WANDB_API_KEY", response["message"])
 
     async def test_cancel_pending_cloud_launch_marks_intent(self) -> None:
         record = JobRecord(
@@ -173,7 +204,9 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("uv pip install --system", job_cfg.setup or "")
             self.assertTrue((record.run_dir / "config.yaml").exists())
 
-    async def test_cloud_launch_reconciles_pending_cancel_after_id_available(self) -> None:
+    async def test_cloud_launch_reconciles_pending_cancel_after_id_available(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg_path = Path(tmp_dir) / "train.yaml"
             cfg_path.write_text("model: {model_name: test/model}\n", encoding="utf-8")
@@ -202,8 +235,14 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 metadata={},
             )
             with (
-                patch("oumi_mcp_server.job_service.launcher.up", return_value=(SimpleNamespace(), status)),
-                patch("oumi_mcp_server.job_service.launcher.cancel", return_value=cancelled) as mock_cancel,
+                patch(
+                    "oumi_mcp_server.job_service.launcher.up",
+                    return_value=(SimpleNamespace(), status),
+                ),
+                patch(
+                    "oumi_mcp_server.job_service.launcher.cancel",
+                    return_value=cancelled,
+                ) as mock_cancel,
                 patch("oumi_mcp_server.job_service.get_registry") as mock_registry,
             ):
                 mock_registry.return_value.persist = AsyncMock(return_value=None)
