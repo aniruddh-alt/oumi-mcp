@@ -809,9 +809,10 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
                 await get_registry().persist(record)
                 return status
         except Exception:
-            logger.debug(
-                "cluster.get_job failed for %s, falling back to launcher.status",
+            logger.warning(
+                "launcher.status failed for %s; returning stale status",
                 record.job_id,
+                exc_info=True,
             )
 
     try:
