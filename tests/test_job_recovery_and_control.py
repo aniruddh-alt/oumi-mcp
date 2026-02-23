@@ -165,8 +165,11 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
 
             job_cfg = captured_job_cfg["cfg"]
             self.assertEqual(Path(job_cfg.working_dir), record.run_dir)
+            # Config path must be the relative filename — SkyPilot sets cwd to working_dir
             self.assertIn("-c config.yaml", job_cfg.run)
+            # PATH extension and binary check must be present in run script
             self.assertIn("command -v oumi", job_cfg.run)
+            self.assertIn("export PATH=", job_cfg.run)
             self.assertIn("uv pip install --system", job_cfg.setup or "")
             self.assertTrue((record.run_dir / "config.yaml").exists())
 
