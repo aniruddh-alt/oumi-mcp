@@ -823,7 +823,7 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
             cluster=record.cluster_name or None,
             id=record.oumi_job_id,
         )
-        for _cloud, jobs in all_statuses.items():
+        for _, jobs in all_statuses.items():
             for s in jobs:
                 if s.id == record.oumi_job_id:
                     record.oumi_status = s

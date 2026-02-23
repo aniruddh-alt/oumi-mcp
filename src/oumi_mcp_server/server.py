@@ -665,6 +665,7 @@ def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
             "warnings": [],
             "paths": {},
         }
+    assert cfg is not None  # _load_yaml_strict returns (None, error) or (dict, None)
 
     hf_authenticated = False
     hf_token: bool | None = None
@@ -1877,7 +1878,7 @@ def _build_status_response(
     }
 
     if status and status.metadata:
-        base["metadata"] = status.metadata
+        base["metadata"] = status.metadata if isinstance(status.metadata, dict) else {"raw": str(status.metadata)}
     base["launch_state"] = record.launch_state
     base["cancel_requested"] = record.cancel_requested
     if record.launch_started_at:
