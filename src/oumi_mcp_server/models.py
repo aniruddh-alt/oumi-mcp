@@ -216,6 +216,8 @@ class JobSubmissionResponse(TypedDict):
     launch_attempts: NotRequired[int]
     launcher_error_type: NotRequired[str]
     staged_config_path: NotRequired[str]
+    idempotency_key: NotRequired[str]
+    is_job_config: NotRequired[bool]
 
 
 class JobStatusResponse(TypedDict):
@@ -432,3 +434,15 @@ class ListModulesResponse(TypedDict):
     total_entries: int
     index_ready: bool
     oumi_version: str
+
+
+class ValidateConfigResponse(TypedDict):
+    """Response from validate_config tool.
+
+    Attributes:
+        ok: True if the config is valid against its schema.
+        error: Validation error message, or None if valid.
+    """
+
+    ok: bool
+    error: str | None
