@@ -125,26 +125,32 @@ def _extract_field_docstrings(cls: type) -> dict[str, str]:
         tree = ast.parse(textwrap.dedent(source))
     except SyntaxError:
         return result
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
+
+    # Find the first top-level ClassDef in the module body (not ast.walk
+    # which can traverse into nested classes in undefined order).
+    class_def = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef)),
+        None,
+    )
+    if class_def is None:
+        return result
+
+    body = class_def.body
+    for i, stmt in enumerate(body):
+        if not isinstance(stmt, ast.AnnAssign):
             continue
-        body = node.body
-        for i, stmt in enumerate(body):
-            if not isinstance(stmt, ast.AnnAssign):
-                continue
-            target = stmt.target
-            if not isinstance(target, ast.Name):
-                continue
-            field_name = target.id
-            if i + 1 < len(body):
-                next_stmt = body[i + 1]
-                if isinstance(next_stmt, ast.Expr) and isinstance(
-                    next_stmt.value, ast.Constant
-                ):
-                    val = next_stmt.value.value
-                    if isinstance(val, str):
-                        result[field_name] = val.strip()
-        break
+        target = stmt.target
+        if not isinstance(target, ast.Name):
+            continue
+        field_name = target.id
+        if i + 1 < len(body):
+            next_stmt = body[i + 1]
+            if isinstance(next_stmt, ast.Expr) and isinstance(
+                next_stmt.value, ast.Constant
+            ):
+                val = next_stmt.value.value
+                if isinstance(val, str):
+                    result[field_name] = val.strip()
 
     return result
 
