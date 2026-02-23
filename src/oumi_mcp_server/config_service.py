@@ -260,6 +260,12 @@ def get_all_configs() -> list[ConfigMetadata]:
     return copy.deepcopy(_get_all_configs_cached())
 
 
+def clear_config_caches() -> None:
+    """Invalidate all config LRU caches after config_sync replaces the cache dir."""
+    _get_all_configs_cached.cache_clear()
+    _parse_yaml_cached.cache_clear()
+
+
 def extract_key_settings(config: dict[str, Any]) -> KeySettings:
     """Extract key training settings from config.
 
@@ -348,13 +354,12 @@ def search_configs(
     Returns:
         List of matching ConfigMetadata, sorted by relevance.
     """
+    def _tokens(s: str) -> list[str]:
+        return [t.lower() for t in s.split() if t.strip()]
+
     filters: list[str] = []
-    if query:
-        filters.append(query.lower())
-    if task:
-        filters.append(task.lower())
-    if model:
-        filters.append(model.lower())
+    for param in (query, task, model):
+        filters.extend(_tokens(param))
 
     keyword_lower = keyword.lower().strip()
 
@@ -383,12 +388,22 @@ def search_configs(
     return matches[:limit]
 
 
-def get_categories(configs_dir: Path, configs_count: int) -> CategoriesResponse:
+def get_categories(
+    configs_dir: Path,
+    configs_count: int,
+    *,
+    oumi_version: str = "",
+    configs_source: str = "",
+    version_warning: str = "",
+) -> CategoriesResponse:
     """List available config categories and model families.
 
     Args:
         configs_dir: Root configs directory.
         configs_count: Total number of configs.
+        oumi_version: Installed oumi library version (populated by caller).
+        configs_source: Where configs are loaded from (populated by caller).
+        version_warning: Non-empty when configs may be mismatched (populated by caller).
 
     Returns:
         CategoriesResponse with all available categories.
@@ -414,7 +429,7 @@ def get_categories(configs_dir: Path, configs_count: int) -> CategoriesResponse:
         "model_families": model_families,
         "api_providers": api_providers,
         "total_configs": configs_count,
-        "oumi_version": "",
-        "configs_source": "",
-        "version_warning": "",
+        "oumi_version": oumi_version,
+        "configs_source": configs_source,
+        "version_warning": version_warning,
     }
