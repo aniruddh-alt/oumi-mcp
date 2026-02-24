@@ -58,12 +58,16 @@ EXAMPLE WORKFLOW:
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -96,9 +100,12 @@ from oumi.core.configs import (
 from packaging.version import Version
 
 from oumi_mcp_server.config_service import (
+    clear_config_caches,
     extract_key_settings,
     find_config_match,
     get_all_configs,
+    get_bundled_configs_dir,
+    get_cache_dir,
     get_categories,
     get_configs_dir,
     parse_yaml,
@@ -107,11 +114,20 @@ from oumi_mcp_server.config_service import (
     search_configs as search_configs_service,
 )
 from oumi_mcp_server.constants import (
+    BUNDLED_OUMI_VERSION,
     CONFIG_SYNC_TIMEOUT_SECONDS,
+    CONFIGS_SYNC_INTERVAL_HOURS,
+    CONFIGS_SYNC_MARKER,
+    CONFIGS_VERSION_MARKER,
     DEFAULT_SEARCH_LIMIT,
     DEFAULT_STREAM_LINES,
+    GITHUB_CONFIGS_ZIP_URL,
+    GITHUB_REPO_URL,
+    GITHUB_ZIP_PREFIX,
     HARDWARE_PACKAGES,
     HF_API_TIMEOUT_SECONDS,
+    JOB_LOGS_DIR,
+    JOB_RUNS_DIR,
     MIN_CC_BF16,
     MIN_CC_FLASH_ATTN,
     MIN_TORCH_VERSION_COMPILE,
@@ -125,12 +141,15 @@ from oumi_mcp_server.docs_service import (
     start_background_indexing,
 )
 from oumi_mcp_server.job_service import (
-    _DEFAULT_CREDENTIAL_FILES,
     JobRecord,
+    JobRuntime,
+    _build_cloud_job_config,
+    _default_file_mounts,
     _is_job_config,
     cancel,
     get_log_paths,
     get_registry,
+    get_runtime,
     launch_job,
     make_job_id,
     poll_status,
@@ -140,6 +159,7 @@ from oumi_mcp_server.job_service import (
 from oumi_mcp_server.models import (
     CategoriesResponse,
     CloudReadiness,
+    ClusterLifecycleResponse,
     ConfigDetail,
     ConfigMetadata,
     DocsSearchResponse,
@@ -161,6 +181,24 @@ from oumi_mcp_server.prompts.mle_prompt import (
     SYNTH_COMMAND_RESOURCE,
     TRAIN_COMMAND_RESOURCE,
 )
+
+try:
+    import torch as _torch
+except Exception:
+    _torch = None
+torch = _torch
+
+try:
+    import sky as _sky
+    from sky import check as _sky_check
+    from sky.clouds.cloud import CloudCapability as _CloudCapability
+except Exception:
+    _sky = None
+    _sky_check = None
+    _CloudCapability = None
+sky = _sky
+sky_check = _sky_check
+CloudCapability = _CloudCapability
 
 _CLOUD_ENV_VAR_HINTS: dict[str, str] = {
     "WANDB_API_KEY": "Weights & Biases logging",
@@ -221,12 +259,6 @@ def get_configs_zip_url(tag: str | None = None) -> tuple[str, str]:
     If *tag* is provided, returns the tagged archive URL; otherwise falls back
     to the main branch.
     """
-    from oumi_mcp_server.constants import (
-        GITHUB_CONFIGS_ZIP_URL,
-        GITHUB_REPO_URL,
-        GITHUB_ZIP_PREFIX,
-    )
-
     if tag:
         url = f"{GITHUB_REPO_URL}/archive/refs/tags/{tag}.zip"
         prefix = f"oumi-{tag.lstrip('v')}/configs/"
@@ -244,9 +276,7 @@ def get_gpu_info() -> dict[str, Any]:
         "gpu_memory_bytes": None,
     }
     try:
-        import torch
-
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             info["accelerator_type"] = "cuda"
             count = torch.cuda.device_count()
             info["accelerator_count"] = count
@@ -260,7 +290,11 @@ def get_gpu_info() -> dict[str, Any]:
                         "compute_capability": f"{props.major}.{props.minor}",
                     }
                 ]
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        elif (
+            torch is not None
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
             info["accelerator_type"] = "mps"
             info["accelerator_count"] = 1
     except Exception:
@@ -384,7 +418,7 @@ def search_configs(
     query: str = "",
     task: str = "",
     model: str = "",
-    keyword: str = "",
+    keyword: str | list[str] = "",
     limit: int = DEFAULT_SEARCH_LIMIT,
 ) -> list[ConfigMetadata]:
     """Search the Oumi config library for ML training, evaluation, and inference configs.
@@ -399,12 +433,15 @@ def search_configs(
     Args:
         query: General search term matching any part of the path.
                Use for size ("8b", "70b"), variant ("instruct"), or technique ("lora", "qlora").
+               Space-separated words are all required (AND logic).
         task: Filter by training/task type.
               Options: sft (supervised fine-tuning), dpo (direct preference optimization),
                        kto, grpo (group relative policy optimization), eval, infer, pretrain
         model: Filter by model family.
                Options: llama3_1, llama3_2, llama4, qwen3, phi4, gemma3, deepseek_r1, etc.
         keyword: Case-insensitive substring match on config file content.
+                 Pass a list to require all keywords to be present (AND logic).
+                 E.g. "packing" or ["packing", "flash_attention"].
         limit: Maximum results to return (default 20).
 
     Returns:
@@ -423,6 +460,7 @@ def search_configs(
         - search_configs(task="grpo") -> All GRPO/RLHF training configs
         - search_configs(query="qlora") -> All QLoRA (quantized LoRA) configs
         - search_configs(keyword="packing") -> Configs mentioning packing in YAML
+        - search_configs(keyword=["packing", "flash_attention"]) -> Configs with both
     """
     configs = get_all_configs()
     return search_configs_service(configs, query, task, model, keyword, limit)
@@ -605,7 +643,11 @@ def pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
         config: Absolute path to the YAML config file.
         cloud: Optional cloud provider to target (e.g. "gcp", "aws", "azure",
                "lambda"). When provided, validates that credentials for this
-               cloud are configured and working. Leave empty for local runs.
+               cloud are configured and working, and returns ``suggested_configs``
+               — a list of config paths from the Oumi library that match the
+               model in your config. Use these with ``get_config(path,
+               include_content=True)`` to retrieve reference YAML examples you
+               can adapt for your cloud job. Leave empty for local runs.
 
     Returns:
         PreFlightCheckResponse with:
@@ -620,6 +662,9 @@ def pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
         - errors: Issues that will cause the run to crash (missing packages, etc.).
         - warnings: Issues that may be fine for remote clusters (no local GPU, etc.).
         - paths: Local paths from the config mapped to whether they exist.
+        - suggested_configs: (cloud only) Relative paths of similar configs from
+          the library. Call ``get_config(path, include_content=True)`` on these
+          to get full YAML you can use as a reference or starting point.
 
     Examples:
         - pre_flight_check("/home/user/train.yaml")
@@ -663,8 +708,7 @@ def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
             "warnings": [],
             "paths": {},
         }
-    assert cfg is not None  # _load_yaml_strict returns (None, error) or (dict, None)
-
+    assert cfg is not None
     hf_authenticated = False
     hf_token: bool | None = None
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -736,7 +780,7 @@ def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
     else:
         summary = "Ready: all checks passed"
 
-    return {
+    result: PreFlightCheckResponse = {
         "blocking": is_blocking,
         "summary": summary,
         "hf_authenticated": hf_authenticated,
@@ -747,6 +791,14 @@ def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
         "warnings": warnings,
         "paths": validate_paths(cfg, config_path.parent),
     }
+
+    if target_cloud:
+        model_name = cfg.get("model", {}).get("model_name", "")
+        all_cfgs = get_all_configs()
+        suggested = search_configs_service(all_cfgs, query=model_name, limit=5)
+        result["suggested_configs"] = [c["path"] for c in suggested]
+
+    return result
 
 
 def _looks_like_hf_repo(val: str) -> bool:
@@ -863,8 +915,8 @@ def _cloud_names(values: list[Any]) -> list[str]:
 def _get_compute_capability(sky: Any) -> Any:
     """Return SkyPilot compute capability enum value."""
     try:
-        from sky.clouds.cloud import CloudCapability
-
+        if CloudCapability is None:
+            raise RuntimeError("CloudCapability is unavailable.")
         return CloudCapability.COMPUTE
     except Exception as exc:
         raise RuntimeError(
@@ -945,12 +997,7 @@ def check_cloud_readiness(
     warnings: list[str] = []
     result = _empty_cloud_readiness()
 
-    try:
-        import sky
-        from sky import check as sky_check  # noqa: F401
-
-        result["sky_installed"] = True
-    except ImportError:
+    if sky is None or sky_check is None:
         result["sky_installed"] = False
         if target_cloud:
             errors.append(
@@ -958,6 +1005,8 @@ def check_cloud_readiness(
                 "Install it with: pip install 'skypilot-nightly[all]'"
             )
         return errors, warnings, result
+
+    result["sky_installed"] = True
 
     # Broad check: get all enabled clouds (uses cache, refreshes if empty).
     try:
@@ -1194,7 +1243,7 @@ def get_started() -> str:
 | `search_configs(query, task, model, keyword)` | Find training configs | `search_configs(model="llama3_1", task="sft")` |
 | `get_config(path, include_content)` | Get config details/YAML | `get_config("llama3_1/sft/8b_lora", include_content=True)` |
 | `validate_config(config, task_type)` | Validate before training | `validate_config("/path/to/config.yaml", "training")` |
-| `pre_flight_check(config, cloud)` | Catch issues before launch (HF auth, hardware, paths, cloud credentials) | `pre_flight_check("/path/to/config.yaml", cloud="gcp")` |
+| `pre_flight_check(config, cloud)` | Catch issues before launch | `pre_flight_check("/path/to/config.yaml", cloud="gcp")` |
 | `get_docs(query, module, kind)` | Search Oumi Python API docs | `get_docs(["TrainingConfig"])` |
 | `list_modules()` | List indexed API modules | `list_modules()` |
 
@@ -1203,9 +1252,11 @@ def get_started() -> str:
 |------|---------|---------|
 | `run_oumi_job(config, cmd)` | Execute Oumi command (dry-run by default) | `run_oumi_job("/path/to/config.yaml", "train")` |
 | `get_job_status(job_id)` | Status snapshot (no streaming) | `get_job_status("train_20260206_...")` |
-| `get_job_logs(job_id, lines)` | Tail log snapshot with requested lines | `get_job_logs("train_20260206_...", lines=200)` |
+| `get_job_logs(job_id, lines)` | Tail log snapshot | `get_job_logs("train_20260206_...", lines=200)` |
 | `cancel_job(job_id)` | Cancel a running job | `cancel_job("train_20260206_...")` |
 | `list_jobs()` | List running and completed jobs | `list_jobs(status="running")` |
+| `stop_cluster(cloud, cluster_name)` | Stop cluster (preserves infra, reduces compute cost) | `stop_cluster("gcp", "sky-xxxx")` |
+| `down_cluster(cloud, cluster_name, confirm, user_confirmation)` | Delete cluster entirely — irreversible | `down_cluster("gcp", "sky-xxxx", confirm=True, user_confirmation="DOWN")` |
 
 ## MCP Resources
 
@@ -1235,44 +1286,72 @@ def get_started() -> str:
   - ✅ GOOD: `dataset_path: /home/user/data/pubmedqa/train.jsonl`
   - ✅ GOOD: `dataset_path: ~/data/pubmedqa/train.jsonl` (~ is expanded)
 
-If you get "file not found" errors during job execution, check your paths!
+For **cloud jobs**, paths inside the job config are relative to `working_dir` (synced to the remote VM).
 
-## Quickstart Workflow
+## ☁️  Cloud Job Workflow (REQUIRED — follow this order)
+
+**When a user asks to run a cloud training job, ALWAYS follow these steps:**
+
+```
+Step 1: pre_flight_check("~/my_config.yaml", cloud="gcp")
+        # → check credentials, then use suggested_configs paths with get_config() for reference YAMLs
+Step 2: [create ~/my_job.yaml based on a reference config or from scratch]
+Step 3: [customize: resources.accelerators, working_dir, run, envs, file_mounts]
+Step 4: run_oumi_job("~/my_job.yaml", "train")           # dry_run=True (default) — shows full JobConfig
+Step 5: run_oumi_job("~/my_job.yaml", "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")
+Step 6: get_job_status(job_id)                           # poll status
+Step 7: get_job_logs(job_id, lines=200)                  # check logs
+Step 8: [when done] stop_cluster("gcp", cluster_name)   # pause OR
+         down_cluster("gcp", cluster_name, confirm=True, user_confirmation="DOWN")  # delete
+```
+
+**Key fields to customize in your cloud job YAML:**
+- `resources.accelerators` — GPU type and count (e.g. `"A100:8"`, `"H100:4"`)
+- `working_dir` — absolute path to your local project (synced to remote)
+- `run` — your oumi command (path relative to `working_dir`)
+- `envs` — API keys (WANDB_API_KEY, HF_TOKEN) that won't be forwarded automatically
+- `file_mounts` — credential files to sync (HF token, .netrc auto-included)
+
+**Tip:** `pre_flight_check(config, cloud="gcp")` returns `suggested_configs` — a list of
+library config paths for the same model family. Call `get_config(path, include_content=True)`
+on any of those paths to get a full YAML reference you can adapt for your cloud job.
+
+## Local Quickstart Workflow
 
 1. **Discover models**: `list_categories()` -> see model_families
 2. **Find recipes**: `search_configs(model="llama3_1", task="sft")`
 3. **Get YAML**: `get_config("llama3_1/sft/8b_lora", include_content=True)`
-4. **Customize**: Modify model_name, datasets, output_dir for your use case
-   - **Use absolute paths** for any file/directory references
+4. **Customize**: Modify model_name, datasets, output_dir — use absolute paths
 5. **Validate**: `validate_config("/your/config.yaml", "training")`
-6. **Pre-flight**: `pre_flight_check("/your/config.yaml", cloud="gcp")` -> verify HF auth, hardware, paths, cloud credentials
-7. **Preview**: `run_oumi_job("/your/config.yaml", "train")` -> dry-run (default)
-8. **Execute**: `run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")`
-9. **Check status**: `get_job_status("train_20260206_...")` -> single snapshot
-10. **Get logs**: `get_job_logs("train_20260206_...", lines=200)` -> bounded tail
-11. **List running**: `list_jobs(status="running")`
+6. **Preview**: `run_oumi_job("/your/config.yaml", "train")` -> dry-run (default)
+7. **Execute**: `run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")`
+8. **Check status**: `get_job_status("train_20260206_...")`
+9. **Get logs**: `get_job_logs("train_20260206_...", lines=200)`
 
 ## Execution Pattern
 
-The execution tools follow a **two-step safety pattern**:
-
 ```
 Step 1 (preview):  run_oumi_job(config, "train")                                    # dry_run=True
-Step 2 (execute):  run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")  # launch
-Step 3 (status):   get_job_status(job_id)                                            # snapshot
-Step 4 (logs):     get_job_logs(job_id, lines=200)                                   # tail snapshot
-Step 5 (cancel):   cancel_job(job_id)                                                # if needed
-Step 5b (force):   cancel_job(job_id, force=True)                                    # SIGKILL
+Step 2 (execute):  run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")
+Step 3 (status):   get_job_status(job_id)
+Step 4 (logs):     get_job_logs(job_id, lines=200)
+Step 5 (cancel):   cancel_job(job_id)
+Step 5b (force):   cancel_job(job_id, force=True)
 ```
 
-Jobs are launched locally or on cloud and return immediately
-with a job ID.
+## Cluster Lifecycle
 
-`get_job_status()` and `get_job_logs()` are snapshot reads, so they do
-not hold open streaming sessions.
+After a cloud job finishes (or to manage costs), use cluster lifecycle tools:
 
-Log files are written to `~/.cache/oumi-mcp/job-logs/{job_id}/` and
-can also be accessed via the `jobs://{job_id}/logs` resource.
+```
+Step 1: get_job_status(job_id)                        # → see "cluster" and "cloud" fields
+Step 2a (pause):  stop_cluster("gcp", "sky-xxxx")     # keeps infra, lower cost, can restart
+Step 2b (delete): down_cluster("gcp", "sky-xxxx", confirm=True, user_confirmation="DOWN")
+```
+
+- **`stop_cluster`**: Pauses compute. Storage costs may still apply. Cluster restartable.
+- **`down_cluster`**: Permanently deletes everything. No more billing. Irreversible.
+- ⚠️  Always `down_cluster` when training is fully done to avoid storage charges.
 
 ## Search Parameters
 
@@ -1292,6 +1371,19 @@ When customizing a config, these are the key fields to modify:
 """
 
 
+def _jobconfig_to_yaml(jc: launcher.JobConfig) -> str:
+    """Render a JobConfig as compact YAML for dry-run display.
+
+    Omits None values and empty dicts/lists so the preview stays readable.
+    """
+    d = {k: v for k, v in dataclasses.asdict(jc).items() if v not in (None, {}, [], "")}
+    if "resources" in d and isinstance(d["resources"], dict):
+        d["resources"] = {
+            k: v for k, v in d["resources"].items() if v not in (None, False, "")
+        }
+    return yaml.dump(d, default_flow_style=False, sort_keys=False)
+
+
 @mcp.tool()
 async def run_oumi_job(
     config_path: str,
@@ -1308,8 +1400,6 @@ async def run_oumi_job(
     disk_size: int | None = None,
     use_spot: bool = False,
     num_nodes: int = 1,
-    setup_script: str | None = None,
-    idempotency_key: str | None = None,
 ) -> JobSubmissionResponse:
     """Execute an Oumi CLI command with background job tracking.
 
@@ -1381,14 +1471,6 @@ async def run_oumi_job(
             preempted).  Default: False.
         num_nodes: Number of nodes for distributed training.  Default: 1.
             Values > 1 automatically enable ``oumi distributed torchrun``.
-        setup_script: Custom setup shell script to override the default
-            (which installs ``oumi[gpu]>=0.7,<0.9``).
-        idempotency_key: Optional key to prevent duplicate job submissions.
-            If a job was previously submitted with this key and is still
-            tracked, the existing job record is returned instead of
-            creating a new one.  Keys are scoped to the current server
-            session plus any persisted state.
-
     Returns:
         JobSubmissionResponse with job_id, status, model info, and either
         an execution plan (dry_run) or a submission confirmation.
@@ -1447,11 +1529,8 @@ async def run_oumi_job(
             "cloud": cloud,
             "cluster_name": cluster_name,
             "model_name": "",
-            "output_dir": "",
             "message": "",
             "error": error,
-            "launch_state": "pending",
-            "cancel_requested": False,
         }
         base.update(overrides)  # type: ignore[typeddict-item]
         return base
@@ -1486,41 +1565,8 @@ async def run_oumi_job(
 
     job_id = make_job_id(command, job_name)
 
-    # --- Idempotency check: return existing job if key already used ---
-    if idempotency_key:
-        existing = await get_registry().get_by_idempotency_key(idempotency_key)
-        if existing is not None:
-            return {
-                "success": True,
-                "job_id": existing.job_id,
-                "status": existing.launch_state,
-                "dry_run": False,
-                "command": existing.command,
-                "config_path": existing.config_path,
-                "cloud": existing.cloud,
-                "cluster_name": existing.cluster_name,
-                "model_name": existing.model_name,
-                "output_dir": existing.output_dir,
-                "message": (
-                    f"Idempotency key '{idempotency_key}' matched existing job "
-                    f"{existing.job_id}. Returning that job's record."
-                ),
-                "idempotency_key": idempotency_key,
-                "oumi_job_id": existing.oumi_job_id,
-                "cluster": existing.cluster_name,
-                "launch_state": existing.launch_state,
-                "cancel_requested": existing.cancel_requested,
-                "launch_started_at": existing.launch_started_at,
-                "launch_finished_at": existing.launch_finished_at,
-                "launch_attempts": existing.launch_attempts,
-                "launcher_error_type": existing.launcher_error_type,
-                "staged_config_path": existing.staged_config_path,
-            }
-
-    # Detect whether the config is a job config for accurate dry-run info
     is_job_config_file = _is_job_config(config_file) if cloud != "local" else False
 
-    # Parse GPU count from accelerator spec for dry-run display and distributed detection
     num_gpus_preview = 0
     if accelerators:
         try:
@@ -1545,49 +1591,44 @@ async def run_oumi_job(
             f"Config type: {'job config (passthrough)' if is_job_config_file else 'training config (wrapped)'}",
             "Validation: strict YAML parsing passed.",
         ]
-        if cloud != "local" and not is_job_config_file:
-            auto_mounts = [
-                c for c in _DEFAULT_CREDENTIAL_FILES if Path(c).expanduser().exists()
-            ]
-            effective_envs = envs or {}
-            if effective_envs:
-                dry_run_msg_parts.append(
-                    f"Remote envs: {', '.join(sorted(effective_envs))}"
-                )
-            else:
-                dry_run_msg_parts.append("Remote envs: none (pass via envs={...})")
-            if auto_mounts:
-                dry_run_msg_parts.append(f"Auto-mount: {', '.join(auto_mounts)}")
-            if num_nodes > 1 or num_gpus_preview > 1:
-                dry_run_msg_parts.append(
-                    f"Distributed: torchrun with {num_nodes} node(s) / "
-                    f"{num_gpus_preview or '?'} GPU(s)"
-                )
-            if use_spot:
-                dry_run_msg_parts.append("Spot instances: enabled")
         dry_run_msg_parts.append(
             "To execute, re-call with dry_run=False, confirm=True, "
             "user_confirmation='EXECUTE'."
         )
-        message = "\n".join(dry_run_msg_parts)  # noqa: F841 (reassigned below for cloud)
-        if cloud != "local" and not is_job_config_file:
-            env_warning = _build_missing_env_warning(envs)
-            if env_warning:
-                message = message + env_warning
-            message = message + (
-                "\n\nTip: For complex cloud setups (wandb, multi-node, custom "
-                "working_dir), consider writing a job config YAML directly:\n"
-                "  resources:\n"
-                f"    cloud: {cloud}\n"
-                '    accelerators: "A100:4"\n'
-                "  working_dir: /path/to/your/project\n"
-                "  envs:\n"
-                "    WANDB_API_KEY: your-key\n"
-                "  setup: |\n"
-                "    pip install oumi[gpu]\n"
-                "  run: |\n"
-                "    oumi train -c configs/my_config.yaml\n"
-                "Then pass that file to run_oumi_job -- it will be used directly."
+        message = "\n".join(dry_run_msg_parts)
+        if cloud != "local":
+            if is_job_config_file:
+                try:
+                    preview_job_cfg = launcher.JobConfig.from_yaml(abs_config)
+                    job_cfg_yaml = _jobconfig_to_yaml(preview_job_cfg)
+                except Exception:
+                    job_cfg_yaml = "(could not parse job config for preview)"
+            else:
+                preview_mounts = _default_file_mounts()
+                if file_mounts:
+                    preview_mounts.update(file_mounts)
+                preview_job_cfg = _build_cloud_job_config(
+                    "config.yaml",
+                    command,
+                    cloud=cloud,
+                    working_dir="<staging dir set at launch>",
+                    accelerators=accelerators or None,
+                    job_name=job_id,
+                    envs=envs,
+                    file_mounts=preview_mounts,
+                    disk_size=disk_size,
+                    use_spot=use_spot,
+                    num_nodes=num_nodes,
+                )
+                job_cfg_yaml = _jobconfig_to_yaml(preview_job_cfg)
+                env_warning = _build_missing_env_warning(envs)
+                if env_warning:
+                    message = message + env_warning
+            message = (
+                message
+                + "\n\n--- Generated JobConfig (review before executing) ---\n"
+                + job_cfg_yaml
+                + "-----------------------------------------------------"
             )
         return {
             "success": True,
@@ -1599,8 +1640,6 @@ async def run_oumi_job(
             "cloud": cloud,
             "cluster_name": cluster_name,
             "model_name": model_name,
-            "output_dir": output_dir,
-            "is_job_config": is_job_config_file,
             "message": message,
         }
 
@@ -1615,7 +1654,6 @@ async def run_oumi_job(
             "cloud": cloud,
             "cluster_name": cluster_name,
             "model_name": model_name,
-            "output_dir": output_dir,
             "message": "",
             "error": (
                 "Execution blocked: launching requires confirm=True and "
@@ -1652,7 +1690,7 @@ async def run_oumi_job(
                 if accelerators and ":" in accelerators
                 else (1 if accelerators else 0)
             )
-            if (num_gpus_for_check > 1 or num_nodes > 1) and not setup_script:
+            if num_gpus_for_check > 1 or num_nodes > 1:
                 preflight_warnings.append(
                     f"Multi-GPU/multi-node job detected (accelerators={accelerators!r}, "
                     f"num_nodes={num_nodes}). Using `oumi distributed torchrun` automatically."
@@ -1670,7 +1708,6 @@ async def run_oumi_job(
                 job_id=job_id,
                 config_path=abs_config,
                 model_name=model_name,
-                output_dir=output_dir,
                 preflight_summary=preflight_summary,
                 preflight_blocking=preflight_blocking,
                 preflight_errors=preflight_errors,
@@ -1684,73 +1721,69 @@ async def run_oumi_job(
                 job_id=job_id,
                 config_path=abs_config,
                 model_name=model_name,
-                output_dir=output_dir,
                 preflight_summary=preflight_summary,
                 preflight_blocking=True,
                 preflight_errors=preflight_errors,
                 preflight_warnings=preflight_warnings,
             )
 
+    submit_time = datetime.now(tz=timezone.utc).isoformat()
     record = JobRecord(
         job_id=job_id,
         command=command,
         config_path=abs_config,
         cloud=cloud,
         cluster_name=cluster_name,
+        oumi_job_id="",
         model_name=model_name,
-        output_dir=output_dir,
-        idempotency_key=idempotency_key or "",
+        status="running",
+        submit_time=submit_time,
     )
-    try:
-        await get_registry().register(record)
-    except ValueError as exc:
-        return _error_response(
-            str(exc),
-            job_id=job_id,
-            config_path=abs_config,
-            model_name=model_name,
-            output_dir=output_dir,
-        )
+    reg = get_registry()
+    reg.add(record)
 
-    if record.is_local:
+    rt = get_runtime(job_id)
+    rt.log_dir = JOB_LOGS_DIR / job_id
+    rt.run_dir = JOB_RUNS_DIR / job_id
+
+    is_local = cloud == "local"
+    if is_local:
         try:
-            start_local_job(record)
+            start_local_job(record, rt)
         except Exception as exc:
-            record.error_message = str(exc)
-            record.launch_state = "failed"
-            await get_registry().persist(record)
+            rt.error_message = str(exc)
+            reg.update(record.job_id, status="failed")
             return _error_response(
                 f"Failed to start job: {exc}",
                 job_id=job_id,
                 config_path=abs_config,
                 model_name=model_name,
-                output_dir=output_dir,
             )
         runner = asyncio.create_task(
-            wait_local_completion(record),
+            wait_local_completion(record, rt),
             name=f"oumi-job-{job_id}",
         )
     else:
         runner = asyncio.create_task(
             launch_job(
                 record,
+                rt,
                 accelerators=accelerators or None,
                 envs=envs,
                 file_mounts=file_mounts,
                 disk_size=disk_size,
                 use_spot=use_spot,
                 num_nodes=num_nodes,
-                setup_script=setup_script,
             ),
             name=f"oumi-job-{job_id}",
         )
-    record.runner_task = runner
+    rt.runner_task = runner
 
     launch_confirmed = False
-    if not record.is_local:
+    if not is_local:
         try:
             await asyncio.wait_for(asyncio.shield(runner), timeout=10.0)
-            launch_confirmed = record.error_message is None
+            launch_confirmed = rt.error_message is None
         except asyncio.TimeoutError:
             launch_confirmed = False
         except Exception:
@@ -1763,14 +1796,16 @@ async def run_oumi_job(
         command,
     )
 
-    if record.error_message and not record.is_local:
+    # Re-read record in case cloud launch updated it
+    record = reg.get(job_id) or record
+
+    if rt.error_message and not is_local:
         return _error_response(
-            f"Failed to launch cloud job: {record.error_message}",
+            f"Failed to launch cloud job: {rt.error_message}",
             status="failed",
             job_id=job_id,
             config_path=abs_config,
             model_name=model_name,
-            output_dir=output_dir,
             preflight_summary=preflight_summary,
             preflight_blocking=preflight_blocking,
             preflight_errors=preflight_errors,
@@ -1778,13 +1813,6 @@ async def run_oumi_job(
             launch_confirmed=launch_confirmed,
             oumi_job_id=record.oumi_job_id,
             cluster=record.cluster_name,
-            launch_state=record.launch_state,
-            cancel_requested=record.cancel_requested,
-            launch_started_at=record.launch_started_at,
-            launch_finished_at=record.launch_finished_at,
-            launch_attempts=record.launch_attempts,
-            launcher_error_type=record.launcher_error_type,
-            staged_config_path=record.staged_config_path,
         )
 
     message = (
@@ -1792,7 +1820,7 @@ async def run_oumi_job(
         f"Use get_job_status('{job_id}') for status and "
         f"get_job_logs('{job_id}', lines=200) for logs."
     )
-    if not record.is_local and not launch_confirmed:
+    if not is_local and not launch_confirmed:
         message = message + " Launch confirmation is pending; re-check status shortly."
 
     return {
@@ -1805,65 +1833,69 @@ async def run_oumi_job(
         "cloud": cloud,
         "cluster_name": cluster_name,
         "model_name": model_name,
-        "output_dir": output_dir,
-        "launch_confirmed": launch_confirmed if not record.is_local else True,
+        "launch_confirmed": launch_confirmed if not is_local else True,
         "preflight_summary": preflight_summary,
         "preflight_blocking": preflight_blocking,
         "preflight_errors": preflight_errors,
         "preflight_warnings": preflight_warnings,
         "oumi_job_id": record.oumi_job_id,
         "cluster": record.cluster_name,
-        "launch_state": record.launch_state,
-        "cancel_requested": record.cancel_requested,
-        "launch_started_at": record.launch_started_at,
-        "launch_finished_at": record.launch_finished_at,
-        "launch_attempts": record.launch_attempts,
-        "launcher_error_type": record.launcher_error_type,
-        "staged_config_path": record.staged_config_path,
         "message": message,
     }
 
 
-def _job_status_str(record: JobRecord) -> str:
+def _job_status_str(record: JobRecord, rt: JobRuntime) -> str:
     """Derive a human-readable status string for any job (local or cloud)."""
-    if record.launch_state == "cancel_requested":
+    if rt.cancel_requested:
         return "cancel_requested"
-    if record.is_local:
-        proc = record.process
+    is_local = record.cloud == "local"
+    if is_local:
+        proc = rt.process
         if proc is None:
-            if record.launch_state in {"pending", "launching"}:
+            if record.status in {"running", "launching"}:
                 return "launching"
-            return "failed" if record.error_message else record.launch_state
+            return "failed" if rt.error_message else record.status
         rc = proc.poll()
         if rc is None:
             return "running"
-        if record.error_message and "Cancelled" in record.error_message:
+        if rt.error_message and "Cancelled" in rt.error_message:
             return "cancelled"
         return "completed" if rc == 0 else "failed"
-    if record.oumi_status:
-        return record.oumi_status.status
-    if record.launch_state and record.launch_state not in {"pending", "launching"}:
-        return record.launch_state
-    if record.error_message:
+    if rt.oumi_status:
+        return rt.oumi_status.status
+    if rt.error_message:
         return "failed"
-    return "launching"
+    return record.status
+
+
+def _is_job_done(record: JobRecord, rt: JobRuntime) -> bool:
+    """Return True if the job is in a terminal state."""
+    if record.status in {"completed", "failed"}:
+        return True
+    is_local = record.cloud == "local"
+    if is_local and rt.process is not None:
+        return rt.process.poll() is not None
+    if rt.oumi_status and rt.oumi_status.done:
+        return True
+    return False
 
 
 def _build_status_response(
     record: JobRecord,
+    rt: JobRuntime,
     *,
     log_file: str = "",
 ) -> JobStatusResponse:
-    """Build a ``JobStatusResponse`` from a ``JobRecord``."""
-    status = record.oumi_status
+    """Build a ``JobStatusResponse`` from a ``JobRecord`` and ``JobRuntime``."""
+    status = rt.oumi_status
+    is_local = record.cloud == "local"
 
-    if record.is_local:
-        status_str = _job_status_str(record)
+    status_str = _job_status_str(record, rt)
+    if is_local:
         oumi_job_id = record.oumi_job_id
         state_str = status_str.upper()
         cluster_str = "local"
     else:
-        status_str = _job_status_str(record)
         oumi_job_id = status.id if status else record.oumi_job_id
         state_str = status.state.name if status and status.state else ""
         cluster_str = status.cluster if status else record.cluster_name
@@ -1879,8 +1911,8 @@ def _build_status_response(
         "cloud": record.cloud,
         "cluster": cluster_str,
         "model_name": record.model_name,
-        "is_done": record.is_done,
-        "error": record.error_message,
+        "is_done": _is_job_done(record, rt),
+        "error": rt.error_message,
     }
 
     if status and status.metadata:
@@ -1889,18 +1921,6 @@ def _build_status_response(
             if isinstance(status.metadata, dict)
             else {"raw": str(status.metadata)}
         )
-    base["launch_state"] = record.launch_state
-    base["cancel_requested"] = record.cancel_requested
-    if record.launch_started_at:
-        base["launch_started_at"] = record.launch_started_at
-    if record.launch_finished_at:
-        base["launch_finished_at"] = record.launch_finished_at
-    if record.launch_attempts:
-        base["launch_attempts"] = record.launch_attempts
-    if record.launcher_error_type:
-        base["launcher_error_type"] = record.launcher_error_type
-    if record.staged_config_path:
-        base["staged_config_path"] = record.staged_config_path
     if log_file:
         base["log_file"] = log_file
 
@@ -1929,23 +1949,20 @@ def _not_found_response(job_id: str) -> JobStatusResponse:
     }
 
 
-async def _resolve_job_record(
+def _resolve_job_record(
     *,
     job_id: str = "",
     oumi_job_id: str = "",
     cloud: str = "",
     cluster_name: str = "",
 ) -> JobRecord | None:
+    reg = get_registry()
     if job_id:
-        record = await get_registry().get(job_id)
+        record = reg.get(job_id)
         if record:
             return record
     if oumi_job_id and cloud:
-        return await get_registry().get_by_cloud_identity(
-            cloud=cloud,
-            cluster_name=cluster_name,
-            oumi_job_id=oumi_job_id,
-        )
+        return reg.find_by_cloud_identity(cloud, oumi_job_id)
     return None
 
 
@@ -1992,7 +2009,7 @@ async def get_job_status(
     if not job_id and not oumi_job_id:
         return _not_found_response("")
 
-    record = await _resolve_job_record(
+    record = _resolve_job_record(
         job_id=job_id,
         oumi_job_id=oumi_job_id,
         cloud=cloud,
@@ -2024,10 +2041,12 @@ async def get_job_status(
             "error": None,
         }
 
-    await poll_status(record)
-    log_paths = get_log_paths(record)
+    rt = get_runtime(record.job_id)
+    await poll_status(record, rt)
+    log_paths = get_log_paths(record, rt)
     return _build_status_response(
         record,
+        rt,
         log_file=str(log_paths["stdout"]) if log_paths["stdout"] else "",
     )
 
@@ -2060,24 +2079,28 @@ def _read_log_tail(stdout_path: Path, lines: int) -> tuple[str, int]:
 
 async def _list_job_summaries(status_filter: str = "all") -> list[JobSummary]:
     """Build normalized job summaries for tools and resources."""
-    records = await get_registry().all_jobs()
+    reg = get_registry()
+    records = reg.all()
     if records:
-        await asyncio.gather(*(poll_status(r) for r in records), return_exceptions=True)
+        await asyncio.gather(
+            *(poll_status(r, get_runtime(r.job_id)) for r in records),
+            return_exceptions=True,
+        )
 
     if status_filter == "running":
-        records = [r for r in records if not r.is_done]
+        records = [r for r in records if not _is_job_done(r, get_runtime(r.job_id))]
     elif status_filter == "completed":
-        records = [r for r in records if r.is_done]
+        records = [r for r in records if _is_job_done(r, get_runtime(r.job_id))]
 
     return [
         {
             "job_id": r.job_id,
             "command": r.command,
-            "status": _job_status_str(r),
+            "status": _job_status_str(r, get_runtime(r.job_id)),
             "cloud": r.cloud,
             "cluster": r.cluster_name,
             "model_name": r.model_name,
-            "is_done": r.is_done,
+            "is_done": _is_job_done(r, get_runtime(r.job_id)),
         }
         for r in records
     ]
@@ -2108,7 +2131,7 @@ async def get_job_logs(
     job_id = job_id.strip()
     oumi_job_id = oumi_job_id.strip()
 
-    record = await _resolve_job_record(
+    record = _resolve_job_record(
         job_id=job_id,
         oumi_job_id=oumi_job_id,
         cloud=cloud,
@@ -2139,8 +2162,9 @@ async def get_job_logs(
             "error": f"Job '{job_id or oumi_job_id}' not found.",
         }
 
-    await poll_status(record)
-    log_paths = get_log_paths(record)
+    rt = get_runtime(record.job_id)
+    await poll_status(record, rt)
+    log_paths = get_log_paths(record, rt)
     stdout_path = log_paths.get("stdout")
     resolved_job_id = record.job_id
 
@@ -2218,7 +2242,7 @@ async def cancel_job(
     job_id = job_id.strip()
     oumi_job_id = oumi_job_id.strip()
 
-    record = await _resolve_job_record(
+    record = _resolve_job_record(
         job_id=job_id,
         oumi_job_id=oumi_job_id,
         cloud=cloud,
@@ -2267,7 +2291,115 @@ async def cancel_job(
             "error": f"Job '{job_id or oumi_job_id}' not found.",
         }
 
-    return await cancel(record, force=force)
+    rt = get_runtime(record.job_id)
+    return await cancel(record, rt, force=force)
+
+
+@mcp.tool()
+async def stop_cluster(cloud: str, cluster_name: str) -> ClusterLifecycleResponse:
+    """Stop a running cluster, preserving infra and reducing compute cost.
+
+    Stopped clusters keep their storage but no longer consume compute resources.
+    They can be restarted by submitting a new job with the same ``cluster_name``.
+
+    Use ``down_cluster`` to fully delete the cluster and stop all billing.
+
+    Get the cluster name from ``get_job_status(job_id)["cluster"]`` or ``list_jobs()``.
+
+    Args:
+        cloud: Cloud provider (e.g. ``"gcp"``, ``"aws"``, ``"azure"``).
+        cluster_name: Name of the cluster to stop.
+
+    Returns:
+        ClusterLifecycleResponse with ``success`` and ``message`` or ``error``.
+    """
+    cloud = cloud.strip().lower()
+    cluster_name = cluster_name.strip()
+    if not cloud or not cluster_name:
+        return {
+            "success": False,
+            "error": "cloud and cluster_name are required.",
+        }
+    try:
+        await asyncio.to_thread(launcher.stop, cloud, cluster_name)
+        return {
+            "success": True,
+            "message": (
+                f"Cluster '{cluster_name}' on {cloud} stopped. "
+                "Infra is preserved; restart by submitting a new job with "
+                f"cluster_name='{cluster_name}'. Storage costs may still apply. "
+                f"Use down_cluster to fully delete."
+            ),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Failed to stop cluster '{cluster_name}' on {cloud}: {exc}",
+        }
+
+
+@mcp.tool()
+async def down_cluster(
+    cloud: str,
+    cluster_name: str,
+    confirm: bool = False,
+    user_confirmation: str = "",
+) -> ClusterLifecycleResponse:
+    """Delete a cluster and all its resources. This is irreversible.
+
+    WARNING: All data on the cluster is permanently deleted and billing stops
+    immediately. This cannot be undone. Use ``stop_cluster`` to pause instead.
+
+    Requires ``confirm=True`` and ``user_confirmation="DOWN"`` to execute.
+    Call without these to see a dry-run description of what would be deleted.
+
+    Get the cluster name from ``get_job_status(job_id)["cluster"]`` or ``list_jobs()``.
+
+    Args:
+        cloud: Cloud provider (e.g. ``"gcp"``, ``"aws"``, ``"azure"``).
+        cluster_name: Name of the cluster to delete.
+        confirm: Must be ``True`` for actual deletion.
+        user_confirmation: Must be exactly ``"DOWN"`` to authorize deletion.
+
+    Returns:
+        ClusterLifecycleResponse with ``success`` and ``message`` or ``error``.
+    """
+    cloud = cloud.strip().lower()
+    cluster_name = cluster_name.strip()
+    if not cloud or not cluster_name:
+        return {
+            "success": False,
+            "error": "cloud and cluster_name are required.",
+        }
+    if not confirm:
+        return {
+            "success": True,
+            "message": (
+                f"Dry run: would permanently delete cluster '{cluster_name}' on {cloud}. "
+                "IRREVERSIBLE — all cluster resources and data will be deleted and "
+                "billing will stop. To confirm, re-call with "
+                "confirm=True, user_confirmation='DOWN'."
+            ),
+        }
+    if user_confirmation != "DOWN":
+        return {
+            "success": False,
+            "error": "Confirmation phrase must be exactly 'DOWN'. Deletion blocked.",
+        }
+    try:
+        await asyncio.to_thread(launcher.down, cloud, cluster_name)
+        return {
+            "success": True,
+            "message": (
+                f"Cluster '{cluster_name}' on {cloud} deleted. "
+                "All resources have been removed and billing has stopped."
+            ),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Failed to delete cluster '{cluster_name}' on {cloud}: {exc}",
+        }
 
 
 @mcp.tool()
@@ -2416,11 +2548,12 @@ async def get_job_logs_resource(job_id: str) -> str:
     For cloud jobs, returns metadata about how to access logs
     (e.g. via ``sky logs``).
     """
-    record = await get_registry().get(job_id)
+    record = get_registry().get(job_id)
     if not record:
         return json.dumps({"error": f"Job '{job_id}' not found"})
 
-    status = await poll_status(record)
+    rt = get_runtime(record.job_id)
+    status = await poll_status(record, rt)
 
     header_parts = [f"Job: {record.job_id}"]
     if status:
@@ -2432,14 +2565,14 @@ async def get_job_logs_resource(job_id: str) -> str:
             header_parts.append(f"Metadata: {status.metadata}")
     else:
         header_parts.append(f"Cloud: {record.cloud}")
-        if record.error_message:
-            header_parts.append(f"Error: {record.error_message}")
+        if rt.error_message:
+            header_parts.append(f"Error: {rt.error_message}")
         else:
             header_parts.append("Status: launching (no status available yet)")
 
     header = "\n".join(header_parts)
 
-    log_paths = get_log_paths(record)
+    log_paths = get_log_paths(record, rt)
     stdout_path = log_paths.get("stdout")
     if stdout_path and stdout_path.exists():
         try:
@@ -2460,9 +2593,6 @@ async def get_job_logs_resource(job_id: str) -> str:
 
 def _read_version_marker() -> str:
     """Read the oumi version that the cached configs were synced for."""
-    from oumi_mcp_server.config_service import get_cache_dir
-    from oumi_mcp_server.constants import CONFIGS_VERSION_MARKER
-
     marker = get_cache_dir() / CONFIGS_VERSION_MARKER
     try:
         return marker.read_text(encoding="utf-8").strip()
@@ -2472,9 +2602,6 @@ def _read_version_marker() -> str:
 
 def _write_version_marker(version: str) -> None:
     """Record which oumi version the cached configs correspond to."""
-    from oumi_mcp_server.config_service import get_cache_dir
-    from oumi_mcp_server.constants import CONFIGS_VERSION_MARKER
-
     marker = get_cache_dir() / CONFIGS_VERSION_MARKER
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(version, encoding="utf-8")
@@ -2487,12 +2614,6 @@ def _is_cache_stale() -> bool:
     the last sync was more than CONFIGS_SYNC_INTERVAL_HOURS ago, or the
     installed oumi version no longer matches the cached version marker.
     """
-    from oumi_mcp_server.config_service import get_cache_dir
-    from oumi_mcp_server.constants import (
-        CONFIGS_SYNC_INTERVAL_HOURS,
-        CONFIGS_SYNC_MARKER,
-    )
-
     cache_dir = get_cache_dir()
     marker = cache_dir / CONFIGS_SYNC_MARKER
 
@@ -2514,8 +2635,6 @@ def _is_cache_stale() -> bool:
             return True
 
     try:
-        import time
-
         age_hours = (time.time() - marker.stat().st_mtime) / 3600
         return age_hours > CONFIGS_SYNC_INTERVAL_HOURS
     except Exception:
@@ -2524,9 +2643,6 @@ def _is_cache_stale() -> bool:
 
 def _touch_sync_marker() -> None:
     """Write/update the sync timestamp marker file."""
-    from oumi_mcp_server.config_service import get_cache_dir
-    from oumi_mcp_server.constants import CONFIGS_SYNC_MARKER
-
     marker = get_cache_dir() / CONFIGS_SYNC_MARKER
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("")
@@ -2538,11 +2654,6 @@ def get_configs_source() -> str:
     Possible values: ``"cache:<version>"``, ``"cache:main"``,
     ``"bundled:<version>"``, ``"env:<path>"``, or ``"unknown"``.
     """
-    import os
-
-    from oumi_mcp_server.config_service import get_bundled_configs_dir, get_cache_dir
-    from oumi_mcp_server.constants import BUNDLED_OUMI_VERSION
-
     env_dir = os.environ.get("OUMI_MCP_CONFIGS_DIR")
     if env_dir:
         p = Path(env_dir)
@@ -2587,8 +2698,6 @@ def config_sync(force: bool = False) -> dict:
         - configs_synced: Number of config files synced (0 if skipped)
         - source: Description of where configs came from
     """
-    from oumi_mcp_server.config_service import get_cache_dir
-
     if not force and not _is_cache_stale():
         logger.info("Config cache is fresh, skipping sync")
         return {
@@ -2683,9 +2792,6 @@ def config_sync(force: bool = False) -> dict:
             raise
         if backup_dir.exists():
             shutil.rmtree(backup_dir, ignore_errors=True)
-
-        # Invalidate caches so subsequent searches use the new configs
-        from oumi_mcp_server.config_service import clear_config_caches
 
         clear_config_caches()
 
