@@ -175,7 +175,6 @@ class JobSubmissionResponse(TypedDict):
         cloud: Cloud provider (e.g. "local", "gcp", "aws").
         cluster_name: Cluster name (empty if auto-generated).
         model_name: HuggingFace model ID extracted from config.
-        output_dir: Output directory extracted from config.
         message: Human-readable summary of what happened or will happen.
         error: Error message if success is False.
         launch_confirmed: True if the launch was confirmed (cloud only).
@@ -185,13 +184,6 @@ class JobSubmissionResponse(TypedDict):
         preflight_warnings: List of warnings from pre-flight.
         oumi_job_id: Job ID on the cluster (if known at submit time).
         cluster: Cluster name (if known at submit time).
-        launch_state: Lifecycle stage from MCP launcher state machine.
-        cancel_requested: Whether cancellation intent is currently recorded.
-        launch_started_at: ISO timestamp when launch began.
-        launch_finished_at: ISO timestamp when launch finished.
-        launch_attempts: Number of launch attempts for this record.
-        launcher_error_type: Exception type captured during launch failure.
-        staged_config_path: Staged config path used for cloud portability.
     """
 
     success: bool
@@ -203,7 +195,6 @@ class JobSubmissionResponse(TypedDict):
     cloud: str
     cluster_name: str
     model_name: str
-    output_dir: str
     message: str
     error: NotRequired[str]
     launch_confirmed: NotRequired[bool]
@@ -213,15 +204,6 @@ class JobSubmissionResponse(TypedDict):
     preflight_warnings: NotRequired[list[str]]
     oumi_job_id: NotRequired[str]
     cluster: NotRequired[str]
-    launch_state: NotRequired[str]
-    cancel_requested: NotRequired[bool]
-    launch_started_at: NotRequired[str]
-    launch_finished_at: NotRequired[str]
-    launch_attempts: NotRequired[int]
-    launcher_error_type: NotRequired[str]
-    staged_config_path: NotRequired[str]
-    idempotency_key: NotRequired[str]
-    is_job_config: NotRequired[bool]
 
 
 class JobStatusResponse(TypedDict):
@@ -242,13 +224,6 @@ class JobStatusResponse(TypedDict):
         metadata: Additional metadata from the launcher.
         log_file: Absolute path to the full stdout log file on disk (if available).
         error: Error message if the job failed or lookup failed.
-        launch_state: Lifecycle stage from MCP launcher state machine.
-        cancel_requested: Whether cancellation intent is currently recorded.
-        launch_started_at: ISO timestamp when launch began.
-        launch_finished_at: ISO timestamp when launch finished.
-        launch_attempts: Number of launch attempts for this record.
-        launcher_error_type: Exception type captured during launch failure.
-        staged_config_path: Staged config path used for cloud portability.
     """
 
     success: bool
@@ -264,13 +239,6 @@ class JobStatusResponse(TypedDict):
     is_done: bool
     metadata: NotRequired[dict[str, Any]]
     log_file: NotRequired[str]
-    launch_state: NotRequired[str]
-    cancel_requested: NotRequired[bool]
-    launch_started_at: NotRequired[str]
-    launch_finished_at: NotRequired[str]
-    launch_attempts: NotRequired[int]
-    launcher_error_type: NotRequired[str]
-    staged_config_path: NotRequired[str]
     error: str | None
 
 
