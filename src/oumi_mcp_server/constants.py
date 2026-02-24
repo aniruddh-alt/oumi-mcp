@@ -104,9 +104,8 @@ VALID_OUMI_COMMANDS = frozenset(
     ["train", "analyze", "synth", "evaluate", "eval", "infer", "tune", "quantize"]
 )
 
-# Maximum number of completed/failed/cancelled jobs to keep in the registry.
-# Oldest finished jobs are evicted first when this limit is exceeded.
-MAX_COMPLETED_JOBS = 50
+# Default path for the single-file JSON job registry.
+DEFAULT_JOBS_FILE: Path = Path.home() / ".cache" / "oumi-mcp" / "oumi-jobs.json"
 
 # ---------------------------------------------------------------------------
 # Job log streaming constants

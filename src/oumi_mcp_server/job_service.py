@@ -16,6 +16,7 @@ Design:
 """
 
 import asyncio
+import dataclasses
 import io
 import json
 import logging
@@ -36,11 +37,10 @@ from oumi.core.launcher.base_cluster import JobStatus as OumiJobStatus
 
 from oumi_mcp_server.config_service import parse_yaml
 from oumi_mcp_server.constants import (
+    DEFAULT_JOBS_FILE,
     JOB_LOGS_DIR,
     JOB_RUNS_DIR,
-    JOB_STATE_DIR,
     LOG_TAIL_INTERVAL_SECONDS,
-    MAX_COMPLETED_JOBS,
 )
 from oumi_mcp_server.models import JobCancelResponse
 
@@ -49,260 +49,116 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class JobRecord:
-    """Tracks a single Oumi job submitted via the MCP server.
-
-    Attributes:
-        job_id: MCP-generated unique identifier.
-        command: Oumi CLI subcommand (train, evaluate, etc.).
-        config_path: Absolute path to the YAML config.
-        cloud: Cloud provider name (e.g. "local", "gcp", "aws").
-        cluster_name: Cluster name used with the launcher.
-        oumi_job_id: The job ID returned by ``oumi.launcher`` (on the cluster).
-        model_name: Model name extracted from config for display.
-        output_dir: Output directory extracted from config for display.
-        log_dir: Directory where stdout/stderr log files are written.
-        process: The ``subprocess.Popen`` handle for local jobs.
-        cluster_obj: The ``BaseCluster`` returned by ``launcher.up()``
-            (cloud jobs only).
-        submit_time: UTC timestamp when the job was submitted.
-        oumi_status: Latest ``JobStatus`` snapshot from the launcher
-            (cloud jobs only).
-        error_message: Error string if submission itself failed.
-        runner_task: The background asyncio task running the job.
-    """
+    """Persisted job metadata. All fields are strings for simple JSON serde."""
 
     job_id: str
     command: str
     config_path: str
-    cloud: str = "local"
-    cluster_name: str = ""
-    oumi_job_id: str = ""
-    model_name: str = ""
-    output_dir: str = ""
-    log_dir: Path = field(init=False)
-    process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
-    cluster_obj: BaseCluster | None = field(default=None, repr=False)
-    submit_time: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    oumi_status: OumiJobStatus | None = field(default=None, repr=False)
-    error_message: str | None = None
-    runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
-    run_dir: Path = field(init=False)
-    staged_config_path: str = ""
-    launch_state: str = "pending"
-    cancel_requested: bool = False
-    launch_attempts: int = 0
-    launch_started_at: str = ""
-    launch_finished_at: str = ""
-    launcher_error_type: str = ""
-    idempotency_key: str = ""
-    _stdout_f: Any = field(default=None, repr=False)
-    _stderr_f: Any = field(default=None, repr=False)
+    cloud: str
+    cluster_name: str
+    oumi_job_id: str
+    model_name: str
+    status: str  # "running", "completed", "failed"
+    submit_time: str  # ISO 8601
 
-    def __post_init__(self) -> None:
-        """Set log_dir to a per-job subdirectory under JOB_LOGS_DIR."""
-        self.log_dir = JOB_LOGS_DIR / self.job_id
-        self.run_dir = JOB_RUNS_DIR / self.job_id
+
+@dataclass
+class JobRuntime:
+    """Ephemeral per-job state -- lives only in memory, never persisted."""
+
+    process: subprocess.Popen | None = None  # type: ignore[type-arg]
+    cluster_obj: BaseCluster | None = None
+    runner_task: asyncio.Task[None] | None = None
+    oumi_status: OumiJobStatus | None = None
+    stdout_f: Any = None
+    stderr_f: Any = None
+    log_dir: Path | None = None
+    run_dir: Path | None = None
+    staged_config_path: str = ""
+    cancel_requested: bool = False
+    error_message: str | None = None
 
     def close_log_files(self) -> None:
-        """Safely close stdout/stderr file handles if open."""
-        for f in (self._stdout_f, self._stderr_f):
+        for f in (self.stdout_f, self.stderr_f):
             if f is not None:
                 try:
                     f.close()
                 except Exception:
                     pass
-        self._stdout_f = None
-        self._stderr_f = None
-
-    @property
-    def is_local(self) -> bool:
-        """True if this is a local job (not cloud)."""
-        return self.cloud == "local"
-
-    @property
-    def is_done(self) -> bool:
-        """True if the job has finished (locally or on a cloud cluster)."""
-        if self.launch_state in {"completed", "failed"}:
-            return True
-        if self.process is not None:
-            return self.process.poll() is not None
-        if self.oumi_status is not None:
-            return self.oumi_status.done
-        return self.error_message is not None
+        self.stdout_f = None
+        self.stderr_f = None
 
 
 class JobRegistry:
-    """Async-safe in-memory registry of ``JobRecord`` instances.
+    """Single-file JSON registry of job records."""
 
-    Evicts the oldest finished jobs when the count exceeds
-    ``MAX_COMPLETED_JOBS``.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, path: Path) -> None:
+        self._path = path
         self._jobs: dict[str, JobRecord] = {}
-        self._idempotency_map: dict[str, str] = {}
-        self._lock = asyncio.Lock()
-        self._state_dir = JOB_STATE_DIR
-        self._state_dir.mkdir(parents=True, exist_ok=True)
-        self._load_persisted_jobs()
+        self._load()
 
-    def _job_state_path(self, job_id: str) -> Path:
-        return self._state_dir / f"{job_id}.json"
-
-    def _record_to_payload(self, record: JobRecord) -> dict[str, Any]:
-        return {
-            "job_id": record.job_id,
-            "command": record.command,
-            "config_path": record.config_path,
-            "cloud": record.cloud,
-            "cluster_name": record.cluster_name,
-            "oumi_job_id": record.oumi_job_id,
-            "model_name": record.model_name,
-            "output_dir": record.output_dir,
-            "submit_time": record.submit_time.isoformat(),
-            "error_message": record.error_message,
-            "staged_config_path": record.staged_config_path,
-            "launch_state": record.launch_state,
-            "cancel_requested": record.cancel_requested,
-            "launch_attempts": record.launch_attempts,
-            "launch_started_at": record.launch_started_at,
-            "launch_finished_at": record.launch_finished_at,
-            "launcher_error_type": record.launcher_error_type,
-            "idempotency_key": record.idempotency_key,
-        }
-
-    def _payload_to_record(self, payload: dict[str, Any]) -> JobRecord:
-        submit_time_raw = payload.get("submit_time")
-        submit_time = datetime.now(tz=timezone.utc)
-        if isinstance(submit_time_raw, str):
-            try:
-                submit_time = datetime.fromisoformat(submit_time_raw)
-            except ValueError:
-                pass
-        return JobRecord(
-            job_id=str(payload.get("job_id", "")),
-            command=str(payload.get("command", "")),
-            config_path=str(payload.get("config_path", "")),
-            cloud=str(payload.get("cloud", "local") or "local"),
-            cluster_name=str(payload.get("cluster_name", "")),
-            oumi_job_id=str(payload.get("oumi_job_id", "")),
-            model_name=str(payload.get("model_name", "")),
-            output_dir=str(payload.get("output_dir", "")),
-            submit_time=submit_time,
-            error_message=payload.get("error_message"),
-            staged_config_path=str(payload.get("staged_config_path", "")),
-            launch_state=str(payload.get("launch_state", "pending") or "pending"),
-            cancel_requested=bool(payload.get("cancel_requested", False)),
-            launch_attempts=int(payload.get("launch_attempts", 0) or 0),
-            launch_started_at=str(payload.get("launch_started_at", "")),
-            launch_finished_at=str(payload.get("launch_finished_at", "")),
-            launcher_error_type=str(payload.get("launcher_error_type", "")),
-            idempotency_key=str(payload.get("idempotency_key", "")),
-        )
-
-    def _persist_unlocked(self, record: JobRecord) -> None:
-        payload = self._record_to_payload(record)
-        path = self._job_state_path(record.job_id)
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    def _delete_persisted_unlocked(self, job_id: str) -> None:
-        path = self._job_state_path(job_id)
-        try:
-            if path.exists():
-                path.unlink()
-        except OSError:
-            logger.debug(
-                "Failed deleting persisted state for %s", job_id, exc_info=True
-            )
-
-    def _load_persisted_jobs(self) -> None:
-        for state_path in sorted(self._state_dir.glob("*.json")):
-            try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-                record = self._payload_to_record(payload)
-                if record.job_id:
-                    self._jobs[record.job_id] = record
-                    if record.idempotency_key:
-                        self._idempotency_map[record.idempotency_key] = record.job_id
-            except Exception:
-                logger.debug("Failed loading persisted job state %s", state_path)
-
-    async def register(self, record: JobRecord) -> None:
-        async with self._lock:
-            if record.job_id in self._jobs:
-                raise ValueError(f"Job ID already exists: {record.job_id}")
-            self._jobs[record.job_id] = record
-            if record.idempotency_key:
-                self._idempotency_map[record.idempotency_key] = record.job_id
-            self._persist_unlocked(record)
-            self._evict_finished_unlocked()
-
-    async def get_by_idempotency_key(self, key: str) -> JobRecord | None:
-        """Return the existing job for *key*, or None if not found."""
-        async with self._lock:
-            job_id = self._idempotency_map.get(key)
-            if job_id:
-                return self._jobs.get(job_id)
-            return None
-
-    def _evict_finished_unlocked(self) -> None:
-        finished = [r for r in self._jobs.values() if r.is_done]
-        if len(finished) <= MAX_COMPLETED_JOBS:
+    def _load(self) -> None:
+        if not self._path.exists():
             return
-        finished.sort(key=lambda r: r.submit_time)
-        for r in finished[: len(finished) - MAX_COMPLETED_JOBS]:
-            del self._jobs[r.job_id]
-            if r.idempotency_key:
-                self._idempotency_map.pop(r.idempotency_key, None)
-            self._delete_persisted_unlocked(r.job_id)
-            logger.debug("Evicted finished job %s from registry", r.job_id)
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            for entry in data:
+                r = JobRecord(**entry)
+                self._jobs[r.job_id] = r
+        except Exception:
+            logger.warning("Could not load %s, starting fresh", self._path)
 
-    async def persist(self, record: JobRecord) -> None:
-        async with self._lock:
-            self._jobs[record.job_id] = record
-            self._persist_unlocked(record)
+    def _save(self) -> None:
+        records = [dataclasses.asdict(r) for r in self._jobs.values()]
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        tmp.rename(self._path)
 
-    async def get(self, job_id: str) -> JobRecord | None:
-        async with self._lock:
-            return self._jobs.get(job_id)
+    def add(self, record: JobRecord) -> None:
+        self._jobs[record.job_id] = record
+        self._save()
 
-    async def get_by_cloud_identity(
-        self,
-        *,
-        cloud: str,
-        cluster_name: str = "",
-        oumi_job_id: str,
-    ) -> JobRecord | None:
-        async with self._lock:
-            for record in self._jobs.values():
-                if record.oumi_job_id != oumi_job_id or record.cloud != cloud:
-                    continue
-                if cluster_name and record.cluster_name != cluster_name:
-                    continue
-                return record
-            return None
+    def update(self, job_id: str, **fields: Any) -> None:
+        record = self._jobs[job_id]
+        for k, v in fields.items():
+            setattr(record, k, v)
+        self._save()
 
-    async def all_jobs(self) -> list[JobRecord]:
-        async with self._lock:
-            return list(self._jobs.values())
+    def get(self, job_id: str) -> JobRecord | None:
+        return self._jobs.get(job_id)
 
-    async def running(self) -> list[JobRecord]:
-        async with self._lock:
-            return [r for r in self._jobs.values() if not r.is_done]
+    def find_by_cloud_identity(self, cloud: str, oumi_job_id: str) -> JobRecord | None:
+        for r in self._jobs.values():
+            if r.cloud == cloud and r.oumi_job_id == oumi_job_id:
+                return r
+        return None
 
-    async def completed(self) -> list[JobRecord]:
-        async with self._lock:
-            return [r for r in self._jobs.values() if r.is_done]
+    def all(self) -> list[JobRecord]:
+        return list(self._jobs.values())
+
+    def remove(self, job_id: str) -> None:
+        self._jobs.pop(job_id, None)
+        self._save()
+
+
+_runtimes: dict[str, JobRuntime] = {}
+
+
+def get_runtime(job_id: str) -> JobRuntime:
+    if job_id not in _runtimes:
+        _runtimes[job_id] = JobRuntime()
+    return _runtimes[job_id]
 
 
 _registry: JobRegistry | None = None
 
 
-def get_registry() -> JobRegistry:
+def get_registry(path: Path | None = None) -> JobRegistry:
     """Return the global ``JobRegistry``, creating it on first access."""
     global _registry
     if _registry is None:
-        _registry = JobRegistry()
+        _registry = JobRegistry(path or DEFAULT_JOBS_FILE)
     return _registry
 
 
@@ -310,10 +166,14 @@ def make_job_id(command: str, job_name: str | None = None) -> str:
     """Generate a human-friendly job ID.
 
     Format: ``{command}_{YYYYMMDD_HHMMSS}_{6-hex}`` or the caller-supplied
-    *job_name* if provided.
+    *job_name* if provided (sanitized to prevent path traversal).
     """
     if job_name:
-        return job_name
+        sanitized = job_name.replace("..", "_").replace("/", "_").replace("\\", "_")
+        sanitized = sanitized.strip("._- ")
+        if not sanitized:
+            raise ValueError(f"Invalid job_name after sanitization: {job_name!r}")
+        return sanitized
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:6]
     return f"{command}_{ts}_{short}"
@@ -348,9 +208,9 @@ _COMMAND_MAP: dict[str, str] = {
 }
 
 _DEFAULT_CLOUD_SETUP_SCRIPT = """set -e
-python3 -m pip install --upgrade pip uv
-uv pip install --system "oumi[gpu]>=0.7,<0.9" || uv pip install --system "oumi>=0.7,<0.9"
-oumi --version || { echo "ERROR: oumi installation failed"; exit 1; }
+pip install uv
+uv pip install --system oumi[gpu]
+command -v oumi || { echo "ERROR: oumi not found after install"; exit 1; }
 """
 
 _DEFAULT_CREDENTIAL_FILES: list[str] = [
@@ -479,7 +339,6 @@ def _build_cloud_job_config(
     disk_size: int | None = None,
     use_spot: bool = False,
     num_nodes: int = 1,
-    setup_script: str | None = None,
 ) -> launcher.JobConfig:
     """Build an ``oumi.launcher.JobConfig`` for **cloud** execution.
 
@@ -503,9 +362,6 @@ def _build_cloud_job_config(
         resources.disk_size = disk_size
     if use_spot:
         resources.use_spot = True
-
-    # Merge default credential mounts with any caller-supplied mounts.
-    # Caller-supplied entries take precedence (update overwrites defaults).
     effective_mounts = _default_file_mounts()
     if file_mounts:
         effective_mounts.update(file_mounts)
@@ -515,7 +371,7 @@ def _build_cloud_job_config(
         num_nodes=num_nodes,
         resources=resources,
         working_dir=working_dir,
-        setup=setup_script or _DEFAULT_CLOUD_SETUP_SCRIPT,
+        setup=_DEFAULT_CLOUD_SETUP_SCRIPT,
         run=run_script,
         envs=envs or {},
         file_mounts=effective_mounts,
@@ -643,7 +499,7 @@ async def _launch_cloud(
     * **Training-config wrapping**: wraps a training YAML in a minimal
       ``launcher.JobConfig``, applying any caller-supplied *envs*, *file_mounts*,
       *disk_size*, *use_spot*, *num_nodes*, and *setup_script* overrides on top of
-      sensible defaults (pinned oumi version, auto-mounted credential files).
+      sensible defaults (oumi with GPU extras, auto-mounted credential files).
 
     Updates *record* in-place with the cluster object, oumi job ID, and
     initial status.  On failure, sets ``record.error_message``.
@@ -810,7 +666,7 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
                 return status
         except Exception:
             logger.warning(
-                "launcher.status failed for %s; returning stale status",
+                "cluster.get_job failed for %s; falling back to launcher.status",
                 record.job_id,
                 exc_info=True,
             )
@@ -865,6 +721,8 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
         record.cancel_requested = True
         record.launch_state = "cancel_requested"
         record.error_message = "Cancellation requested while launch is pending."
+        if record.runner_task and not record.runner_task.done():
+            record.runner_task.cancel()
         await get_registry().persist(record)
         return {
             "success": True,
@@ -922,7 +780,7 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
 def get_log_paths(record: JobRecord) -> dict[str, Path | None]:
     """Return paths to the stdout and stderr log files for a job.
 
-    For **local** jobs spawned by ``_launch_local()``, files are named
+    For **local** jobs spawned by ``start_local_job()``, files are named
     ``{timestamp}_{job_id}.stdout`` / ``.stderr``.
 
     For **cloud** jobs that went through ``oumi.launcher``, the
@@ -1064,9 +922,15 @@ async def stream_cloud_logs(
             pass
         return lines
 
-    while not done_event.is_set():
-        lines = await asyncio.to_thread(_read_lines)
-        for line in lines:
-            yield line
-        if not lines:
-            await asyncio.sleep(LOG_TAIL_INTERVAL_SECONDS)
+    try:
+        while not done_event.is_set():
+            lines = await asyncio.to_thread(_read_lines)
+            for line in lines:
+                yield line
+            if not lines:
+                await asyncio.sleep(LOG_TAIL_INTERVAL_SECONDS)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
