@@ -115,8 +115,6 @@ DEFAULT_JOBS_FILE: Path = Path.home() / ".cache" / "oumi-mcp" / "oumi-jobs.json"
 # The oumi.launcher LocalClient writes subprocess stdout/stderr here.
 JOB_LOGS_DIR: Path = Path.home() / ".cache" / "oumi-mcp" / "job-logs"
 
-JOB_STATE_DIR: Path = Path.home() / ".cache" / "oumi-mcp" / "jobs"
-
 # Directory for per-job cloud launch staging files.
 JOB_RUNS_DIR: Path = Path.home() / ".cache" / "oumi-mcp" / "job-runs"
 
