@@ -92,6 +92,7 @@ prerelease = "allow"
 [tool.pyright]
 pythonVersion = "3.11"
 reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
 exclude = [
     "src/oumi_mcp_server/configs/projects/",
 ]

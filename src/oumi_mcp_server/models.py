@@ -143,6 +143,9 @@ class PreFlightCheckResponse(TypedDict):
         errors: Issues that will cause the training run to crash.
         warnings: Potential issues that may be fine if targeting a remote cluster.
         paths: Local filesystem paths from the config mapped to whether they exist.
+        suggested_configs: Relative config paths relevant to the model in this config.
+            Only present when ``cloud`` was specified. Pass these to ``get_config()``
+            to retrieve full YAML examples for reference or adaptation.
     """
 
     blocking: bool
@@ -154,6 +157,7 @@ class PreFlightCheckResponse(TypedDict):
     errors: list[str]
     warnings: list[str]
     paths: dict[str, bool]
+    suggested_configs: NotRequired[list[str]]
 
 
 class JobSubmissionResponse(TypedDict):
@@ -446,3 +450,33 @@ class ValidateConfigResponse(TypedDict):
 
     ok: bool
     error: str | None
+
+
+class ClusterLifecycleResponse(TypedDict):
+    """Response from stop_cluster and down_cluster tools.
+
+    Attributes:
+        success: Whether the operation succeeded.
+        message: Human-readable result description.
+        error: Error message if the operation failed.
+    """
+
+    success: bool
+    message: NotRequired[str]
+    error: NotRequired[str]
+
+
+class CloudJobConfigTemplateResponse(TypedDict):
+    """Response from get_cloud_job_config_template tool.
+
+    Attributes:
+        cloud: Normalized cloud provider name.
+        template_yaml: Complete job config YAML string, ready to customize and save.
+        key_fields: List of fields the agent must customize before using.
+        notes: Cloud-specific notes and tips.
+    """
+
+    cloud: str
+    template_yaml: str
+    key_fields: list[str]
+    notes: str

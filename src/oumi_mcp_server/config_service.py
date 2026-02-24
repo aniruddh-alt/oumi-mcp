@@ -309,27 +309,20 @@ def find_config_match(
     path_lower = path_query.lower()
     candidates: list[ConfigMetadata] = []
 
-    # Find all candidates
     for cfg in configs:
         if cfg["path"] == path_query:
-            return cfg  # Exact match found
+            return cfg
         if path_lower in cfg["path"].lower():
             candidates.append(cfg)
 
     if not candidates:
         return None
-
-    # Prefer exact train.yaml match
     for c in candidates:
         if c["path"].endswith(f"/{TRAIN_YAML}"):
             return c
-
-    # Fallback to any train.yaml variant
     for c in candidates:
         if TRAIN_YAML in c["path"]:
             return c
-
-    # Return first candidate
     return candidates[0]
 
 
@@ -338,7 +331,7 @@ def search_configs(
     query: str = "",
     task: str = "",
     model: str = "",
-    keyword: str = "",
+    keyword: str | list[str] = "",
     limit: int = 20,
 ) -> list[ConfigMetadata]:
     """Search for configs matching the given filters.
@@ -348,12 +341,14 @@ def search_configs(
         query: General search term (case-insensitive substring match).
         task: Task type filter.
         model: Model family filter.
-        keyword: Case-insensitive substring match on file content.
+        keyword: Case-insensitive substring match(es) on file content.
+            Pass a list to require all keywords to be present (AND logic).
         limit: Maximum number of results to return.
 
     Returns:
         List of matching ConfigMetadata, sorted by relevance.
     """
+
     def _tokens(s: str) -> list[str]:
         return [t.lower() for t in s.split() if t.strip()]
 
@@ -361,29 +356,33 @@ def search_configs(
     for param in (query, task, model):
         filters.extend(_tokens(param))
 
-    keyword_lower = keyword.lower().strip()
+    keywords: list[str] = (
+        [k.lower().strip() for k in keyword if k.strip()]
+        if isinstance(keyword, list)
+        else [keyword.lower().strip()]
+        if keyword.strip()
+        else []
+    )
 
-    if not filters and not keyword_lower:
-        # Return a sample of configs sorted alphabetically
+    if not filters and not keywords:
         return sorted(configs, key=lambda x: x["path"])[:limit]
 
     matches: list[ConfigMetadata] = []
-    configs_dir = get_configs_dir() if keyword_lower else None
+    configs_dir = get_configs_dir() if keywords else None
     for cfg in configs:
         path_lower = cfg["path"].lower()
         if not all(f in path_lower for f in filters):
             continue
-        if keyword_lower and configs_dir is not None:
+        if keywords and configs_dir is not None:
             config_path = configs_dir / cfg["path"]
             try:
                 content = config_path.read_text(encoding="utf-8").lower()
             except Exception:
                 continue
-            if keyword_lower not in content:
+            if not all(kw in content for kw in keywords):
                 continue
         matches.append(cfg)
 
-    # Sort: prefer configs with datasets defined, then alphabetically
     matches.sort(key=lambda x: (-len(x["datasets"]), x["path"]))
     return matches[:limit]
 
