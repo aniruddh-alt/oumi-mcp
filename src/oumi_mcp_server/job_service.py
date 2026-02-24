@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,8 +38,6 @@ from oumi.core.launcher.base_cluster import JobStatus as OumiJobStatus
 from oumi_mcp_server.config_service import parse_yaml
 from oumi_mcp_server.constants import (
     DEFAULT_JOBS_FILE,
-    JOB_LOGS_DIR,
-    JOB_RUNS_DIR,
     LOG_TAIL_INTERVAL_SECONDS,
 )
 from oumi_mcp_server.models import JobCancelResponse
@@ -302,7 +300,9 @@ def _build_shell_command(
     return f"set -e\n{path_preamble}{oumi_cmd} -c {shlex.quote(config_path)}"
 
 
-def _stage_cloud_config(record: JobRecord, *, working_dir: str | None = None) -> str:
+def _stage_cloud_config(
+    record: JobRecord, rt: JobRuntime, *, working_dir: str | None = None
+) -> str:
     """Copy config (and optionally a working directory) into a per-job run directory.
 
     For training-config wrapping mode, only the config file is copied.
@@ -311,18 +311,19 @@ def _stage_cloud_config(record: JobRecord, *, working_dir: str | None = None) ->
 
     Returns the staged config filename (relative to the run directory).
     """
-    record.run_dir.mkdir(parents=True, exist_ok=True)
+    assert rt.run_dir is not None
+    rt.run_dir.mkdir(parents=True, exist_ok=True)
 
     if working_dir:
         src = Path(working_dir).expanduser()
-        if src.is_dir() and src != record.run_dir:
-            shutil.copytree(src, record.run_dir, dirs_exist_ok=True)
+        if src.is_dir() and src != rt.run_dir:
+            shutil.copytree(src, rt.run_dir, dirs_exist_ok=True)
         elif src.is_file():
-            shutil.copy2(src, record.run_dir / src.name)
+            shutil.copy2(src, rt.run_dir / src.name)
 
-    staged_config = record.run_dir / "config.yaml"
+    staged_config = rt.run_dir / "config.yaml"
     shutil.copy2(record.config_path, staged_config)
-    record.staged_config_path = str(staged_config)
+    rt.staged_config_path = str(staged_config)
     return staged_config.name
 
 
@@ -378,32 +379,26 @@ def _build_cloud_job_config(
     )
 
 
-def start_local_job(record: JobRecord) -> None:
+def start_local_job(record: JobRecord, rt: JobRuntime) -> None:
     """Start a local job by spawning the Oumi CLI directly.
 
     Creates the log directory, starts the subprocess via ``Popen``, and
-    sets ``record.process`` and ``record.oumi_job_id``. Raises on failure
+    sets ``rt.process`` and ``record.oumi_job_id``. Raises on failure
     (e.g. command not found, permission denied).
 
-    Bypasses ``oumi.launcher.LocalCluster`` (which requires a
-    ``working_dir``) and instead runs ``oumi <cmd> -c <config>``
-    via ``subprocess.Popen`` with an argv list (no shell).
-
-    Stdout and stderr are written to files in ``record.log_dir`` so
+    Stdout and stderr are written to files in ``rt.log_dir`` so
     that ``tail_log_file()`` can stream them to the MCP client.
     """
     cmd_argv = _build_local_command(record.config_path, record.command)
 
-    record.launch_state = "launching"
-    record.launch_attempts += 1
-    record.launch_started_at = datetime.now(tz=timezone.utc).isoformat()
-    record.log_dir.mkdir(parents=True, exist_ok=True)
+    assert rt.log_dir is not None
+    rt.log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(tz=timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
-    stdout_path = record.log_dir / f"{ts}_{record.job_id}.stdout"
-    stderr_path = record.log_dir / f"{ts}_{record.job_id}.stderr"
+    stdout_path = rt.log_dir / f"{ts}_{record.job_id}.stdout"
+    stderr_path = rt.log_dir / f"{ts}_{record.job_id}.stderr"
 
     env = os.environ.copy()
-    env["OUMI_LOGGING_DIR"] = str(record.log_dir)
+    env["OUMI_LOGGING_DIR"] = str(rt.log_dir)
 
     stdout_f = open(stdout_path, "w")
     stderr_f = open(stderr_path, "w")
@@ -420,12 +415,11 @@ def start_local_job(record: JobRecord) -> None:
         stderr_f.close()
         raise
 
-    record.process = proc
+    rt.process = proc
     record.oumi_job_id = str(proc.pid)
-    record.launch_finished_at = datetime.now(tz=timezone.utc).isoformat()
-    record.launch_state = "running"
-    record._stdout_f = stdout_f
-    record._stderr_f = stderr_f
+    get_registry().update(record.job_id, oumi_job_id=record.oumi_job_id, status="running")
+    rt.stdout_f = stdout_f
+    rt.stderr_f = stderr_f
     logger.info(
         "Local job %s started (pid=%s): %s",
         record.job_id,
@@ -434,21 +428,20 @@ def start_local_job(record: JobRecord) -> None:
     )
 
 
-async def wait_local_completion(record: JobRecord) -> None:
+async def wait_local_completion(record: JobRecord, rt: JobRuntime) -> None:
     """Await completion of a local job subprocess.
 
-    Waits for the process to exit (in a thread) and sets
-    ``record.error_message`` on non-zero exit code.  This is slow
-    (minutes/hours) and should be run as a background task.
+    Waits for the process to exit (in a thread) and updates
+    ``record.status`` via the registry on completion.
     """
-    proc = record.process
+    proc = rt.process
     if proc is None:
         return
 
     stderr_path = None
-    if record._stderr_f is not None:
+    if rt.stderr_f is not None:
         try:
-            stderr_path = record._stderr_f.name
+            stderr_path = rt.stderr_f.name
         except Exception:
             pass
 
@@ -456,27 +449,27 @@ async def wait_local_completion(record: JobRecord) -> None:
         returncode = await asyncio.to_thread(proc.wait)
 
         if returncode != 0:
-            record.error_message = f"Process exited with code {returncode}." + (
+            rt.error_message = f"Process exited with code {returncode}." + (
                 f" See stderr: {stderr_path}" if stderr_path else ""
             )
-            record.launch_state = "failed"
+            get_registry().update(record.job_id, status="failed")
             logger.warning(
                 "Local job %s exited with code %d", record.job_id, returncode
             )
         else:
-            record.launch_state = "completed"
+            get_registry().update(record.job_id, status="completed")
             logger.info("Local job %s completed successfully", record.job_id)
     except Exception as exc:
-        record.error_message = str(exc)
-        record.launch_state = "failed"
+        rt.error_message = str(exc)
+        get_registry().update(record.job_id, status="failed")
         logger.exception("Failed to run local job %s", record.job_id)
     finally:
-        record.close_log_files()
-        await get_registry().persist(record)
+        rt.close_log_files()
 
 
 async def _launch_cloud(
     record: JobRecord,
+    rt: JobRuntime,
     *,
     accelerators: str | None = None,
     envs: dict[str, str] | None = None,
@@ -501,29 +494,22 @@ async def _launch_cloud(
       *disk_size*, *use_spot*, *num_nodes*, and *setup_script* overrides on top of
       sensible defaults (oumi with GPU extras, auto-mounted credential files).
 
-    Updates *record* in-place with the cluster object, oumi job ID, and
-    initial status.  On failure, sets ``record.error_message``.
+    Updates *record* and *rt* in-place with the cluster object, oumi job ID, and
+    initial status.  On failure, sets ``rt.error_message``.
     """
-    record.launch_state = "launching"
-    record.launch_attempts += 1
-    record.launch_started_at = datetime.now(tz=timezone.utc).isoformat()
-    await get_registry().persist(record)
+    reg = get_registry()
+    reg.update(record.job_id, status="launching")
 
     try:
         config_path = Path(record.config_path)
         job_config_mode = _is_job_config(config_path)
 
         if job_config_mode:
-            # Passthrough: load the job config YAML directly.
-            # Stage the config file into the run dir; the job config's own
-            # working_dir (if any) is preserved inside the YAML.
             config_parent = str(Path(record.config_path).expanduser().resolve().parent)
-            _stage_cloud_config(record, working_dir=config_parent)
-            job_config = launcher.JobConfig.from_yaml(record.staged_config_path)
-            # Allow the job name to be overridden with the MCP job ID.
+            _stage_cloud_config(record, rt, working_dir=config_parent)
+            job_config = launcher.JobConfig.from_yaml(rt.staged_config_path)
             if not job_config.name:
                 job_config.name = record.job_id
-            # If caller provided extra overrides, layer them on top.
             if envs:
                 merged = dict(job_config.envs or {})
                 merged.update(envs)
@@ -533,12 +519,12 @@ async def _launch_cloud(
                 merged_mounts.update(file_mounts)
                 job_config.file_mounts = merged_mounts
         else:
-            staged_config_name = _stage_cloud_config(record)
+            staged_config_name = _stage_cloud_config(record, rt)
             job_config = _build_cloud_job_config(
                 staged_config_name,
                 record.command,
                 cloud=record.cloud,
-                working_dir=str(record.run_dir),
+                working_dir=str(rt.run_dir),
                 accelerators=accelerators,
                 job_name=record.job_id,
                 envs=envs,
@@ -546,26 +532,31 @@ async def _launch_cloud(
                 disk_size=disk_size,
                 use_spot=use_spot,
                 num_nodes=num_nodes,
-                setup_script=setup_script,
             )
         cluster, status = await asyncio.to_thread(
             launcher.up,
             job_config,
             record.cluster_name or None,
         )
-        record.cluster_obj = cluster
-        record.oumi_job_id = status.id if status else ""
-        record.oumi_status = status
-        record.cluster_name = status.cluster if status else record.cluster_name
-        record.launch_finished_at = datetime.now(tz=timezone.utc).isoformat()
-        record.launch_state = "submitted"
+        rt.cluster_obj = cluster
+        oumi_job_id = status.id if status else ""
+        rt.oumi_status = status
+        cluster_name = status.cluster if status else record.cluster_name
+        reg.update(
+            record.job_id,
+            oumi_job_id=oumi_job_id,
+            cluster_name=cluster_name,
+            status="running",
+        )
+        # Refresh the local record reference
+        record = reg.get(record.job_id) or record
         logger.info(
             "Cloud job %s launched on %s (oumi_id=%s)",
             record.job_id,
             record.cloud,
             record.oumi_job_id,
         )
-        if record.cancel_requested and record.oumi_job_id:
+        if rt.cancel_requested and record.oumi_job_id:
             try:
                 result_status = await asyncio.to_thread(
                     launcher.cancel,
@@ -573,26 +564,22 @@ async def _launch_cloud(
                     record.cloud,
                     record.cluster_name,
                 )
-                record.oumi_status = result_status
-                record.launch_state = "cancel_requested"
+                rt.oumi_status = result_status
+                reg.update(record.job_id, status="failed")
             except Exception as cancel_exc:
-                record.error_message = (
+                rt.error_message = (
                     "Cancellation was requested during launch, but automatic "
                     f"cloud cancellation failed: {cancel_exc}"
                 )
-                record.launcher_error_type = type(cancel_exc).__name__
-        await get_registry().persist(record)
     except Exception as exc:
-        record.error_message = str(exc)
-        record.launcher_error_type = type(exc).__name__
-        record.launch_finished_at = datetime.now(tz=timezone.utc).isoformat()
-        record.launch_state = "failed"
+        rt.error_message = str(exc)
+        reg.update(record.job_id, status="failed")
         logger.exception("Failed to launch cloud job %s", record.job_id)
-        await get_registry().persist(record)
 
 
 async def launch_job(
     record: JobRecord,
+    rt: JobRuntime,
     *,
     accelerators: str | None = None,
     envs: dict[str, str] | None = None,
@@ -607,12 +594,13 @@ async def launch_job(
     For local jobs, spawns the Oumi CLI directly via subprocess.
     For cloud jobs, delegates to ``oumi.launcher.up()``.
     """
-    if record.is_local:
-        start_local_job(record)
-        await wait_local_completion(record)
+    if record.cloud == "local":
+        start_local_job(record, rt)
+        await wait_local_completion(record, rt)
     else:
         await _launch_cloud(
             record,
+            rt,
             accelerators=accelerators,
             envs=envs,
             file_mounts=file_mounts,
@@ -623,7 +611,7 @@ async def launch_job(
         )
 
 
-async def poll_status(record: JobRecord) -> OumiJobStatus | None:
+async def poll_status(record: JobRecord, rt: JobRuntime) -> OumiJobStatus | None:
     """Fetch the latest status for a job.
 
     For **local** jobs, checks the subprocess return code directly.
@@ -631,38 +619,39 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
     back to ``launcher.status()``.
 
     Returns an ``OumiJobStatus`` for cloud jobs, or ``None`` for local
-    jobs (status is derived from ``record.process`` instead).
+    jobs (status is derived from ``rt.process`` instead).
     """
-    # ---- Local jobs: derive status from the subprocess ----
-    if record.is_local:
-        # Nothing to poll -- the process handle *is* the status.
+    if record.cloud == "local":
         return None
 
-    # ---- Cloud jobs: delegate to oumi.launcher ----
-    if record.error_message and record.cluster_obj is None:
-        return record.oumi_status
+    reg = get_registry()
 
-    def _derive_launch_state(status: OumiJobStatus) -> str:
+    if rt.error_message and rt.cluster_obj is None:
+        return rt.oumi_status
+
+    def _derive_status(status: OumiJobStatus) -> str:
         if not status.done:
             return "running"
         status_str = (status.status or "").lower()
         if "fail" in status_str:
             return "failed"
         if "cancel" in status_str:
-            return "cancel_requested"
+            return "failed"
         return "completed"
 
-    if record.cluster_obj and record.oumi_job_id:
+    if rt.cluster_obj and record.oumi_job_id:
         try:
             status = await asyncio.to_thread(
-                record.cluster_obj.get_job, record.oumi_job_id
+                rt.cluster_obj.get_job, record.oumi_job_id
             )
             if status:
-                record.oumi_status = status
-                record.oumi_job_id = status.id or record.oumi_job_id
-                record.cluster_name = status.cluster or record.cluster_name
-                record.launch_state = _derive_launch_state(status)
-                await get_registry().persist(record)
+                rt.oumi_status = status
+                reg.update(
+                    record.job_id,
+                    oumi_job_id=status.id or record.oumi_job_id,
+                    cluster_name=status.cluster or record.cluster_name,
+                    status=_derive_status(status),
+                )
                 return status
         except Exception:
             logger.warning(
@@ -673,7 +662,7 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
 
     try:
         if not record.oumi_job_id:
-            return record.oumi_status
+            return rt.oumi_status
         all_statuses = await asyncio.to_thread(
             launcher.status,
             cloud=record.cloud,
@@ -683,11 +672,13 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
         for _, jobs in all_statuses.items():
             for s in jobs:
                 if s.id == record.oumi_job_id:
-                    record.oumi_status = s
-                    record.oumi_job_id = s.id or record.oumi_job_id
-                    record.cluster_name = s.cluster or record.cluster_name
-                    record.launch_state = _derive_launch_state(s)
-                    await get_registry().persist(record)
+                    rt.oumi_status = s
+                    reg.update(
+                        record.job_id,
+                        oumi_job_id=s.id or record.oumi_job_id,
+                        cluster_name=s.cluster or record.cluster_name,
+                        status=_derive_status(s),
+                    )
                     return s
     except Exception:
         logger.warning(
@@ -696,10 +687,12 @@ async def poll_status(record: JobRecord) -> OumiJobStatus | None:
             exc_info=True,
         )
 
-    return record.oumi_status
+    return rt.oumi_status
 
 
-async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse:
+async def cancel(
+    record: JobRecord, rt: JobRuntime, *, force: bool = False
+) -> JobCancelResponse:
     """Cancel a job.
 
     For **local** jobs, sends SIGTERM (or SIGKILL if *force* is True)
@@ -708,22 +701,23 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
 
     Returns a dict with ``success`` (bool) and ``message`` or ``error``.
     """
-    if record.is_done:
+    reg = get_registry()
+
+    if record.status in {"completed", "failed"}:
         return {
             "success": False,
             "error": (
                 f"Job {record.job_id} is already finished "
-                f"(status: {record.oumi_status.status if record.oumi_status else 'unknown'})"
+                f"(status: {rt.oumi_status.status if rt.oumi_status else record.status})"
             ),
         }
 
-    if not record.oumi_job_id and record.process is None:
-        record.cancel_requested = True
-        record.launch_state = "cancel_requested"
-        record.error_message = "Cancellation requested while launch is pending."
-        if record.runner_task and not record.runner_task.done():
-            record.runner_task.cancel()
-        await get_registry().persist(record)
+    if not record.oumi_job_id and rt.process is None:
+        rt.cancel_requested = True
+        rt.error_message = "Cancellation requested while launch is pending."
+        reg.update(record.job_id, status="failed")
+        if rt.runner_task and not rt.runner_task.done():
+            rt.runner_task.cancel()
         return {
             "success": True,
             "message": (
@@ -732,19 +726,18 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
             ),
         }
 
-    if record.is_local and record.process is not None:
+    if record.cloud == "local" and rt.process is not None:
         try:
             if force:
-                record.process.kill()  # SIGKILL
+                rt.process.kill()  # SIGKILL
                 action = "killed (SIGKILL)"
             else:
-                record.process.terminate()  # SIGTERM
+                rt.process.terminate()  # SIGTERM
                 action = "terminated (SIGTERM)"
-            record.cancel_requested = True
-            record.launch_state = "cancel_requested"
-            record.error_message = f"Cancelled by user ({action})"
+            rt.cancel_requested = True
+            rt.error_message = f"Cancelled by user ({action})"
+            reg.update(record.job_id, status="failed")
             logger.info("Local job %s %s", record.job_id, action)
-            await get_registry().persist(record)
             return {
                 "success": True,
                 "message": f"Job {record.job_id} {action}.",
@@ -762,10 +755,9 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
             record.cloud,
             record.cluster_name,
         )
-        record.cancel_requested = True
-        record.launch_state = "cancel_requested"
-        record.oumi_status = result_status
-        await get_registry().persist(record)
+        rt.cancel_requested = True
+        rt.oumi_status = result_status
+        reg.update(record.job_id, status="failed")
         return {
             "success": True,
             "message": f"Job {record.job_id} cancel requested on {record.cloud}/{record.cluster_name}.",
@@ -777,25 +769,15 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
         }
 
 
-def get_log_paths(record: JobRecord) -> dict[str, Path | None]:
+def get_log_paths(record: JobRecord, rt: JobRuntime) -> dict[str, Path | None]:
     """Return paths to the stdout and stderr log files for a job.
-
-    For **local** jobs spawned by ``start_local_job()``, files are named
-    ``{timestamp}_{job_id}.stdout`` / ``.stderr``.
-
-    For **cloud** jobs that went through ``oumi.launcher``, the
-    ``LocalClient`` names them ``{timestamp}_{oumi_job_id}.stdout`` /
-    ``.stderr``.
-
-    Since the timestamp prefix varies, we glob for the job/oumi ID
-    suffix first, then fall back to any matching extension.
 
     Returns a dict with ``"stdout"`` and ``"stderr"`` keys, each
     mapping to a ``Path`` or ``None`` if the file doesn't exist yet.
     """
     result: dict[str, Path | None] = {"stdout": None, "stderr": None}
-    log_dir = record.log_dir
-    if not log_dir.is_dir():
+    log_dir = rt.log_dir
+    if log_dir is None or not log_dir.is_dir():
         return result
 
     id_candidates = [record.job_id]
@@ -877,6 +859,7 @@ async def tail_log_file(
 
 async def stream_cloud_logs(
     record: JobRecord,
+    rt: JobRuntime,
     done_event: asyncio.Event,
 ) -> AsyncIterator[str]:
     """Yield log lines from ``cluster.get_logs_stream()`` for cloud jobs.
@@ -884,7 +867,7 @@ async def stream_cloud_logs(
     Falls back silently (returns without yielding) if the cluster does not
     support log streaming (raises ``NotImplementedError``).
     """
-    cluster = record.cluster_obj
+    cluster = rt.cluster_obj
     if cluster is None:
         return
 
