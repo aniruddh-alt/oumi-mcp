@@ -1165,10 +1165,8 @@ async def _get_cloud_logs(
             timeout=_CLOUD_LOG_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        try:
-            stream.close()
-        except Exception:
-            pass
+        # Don't cross-thread close the stream — just return partial output.
+        # The worker thread will finish when the stream yields EOF or errors.
         raw = "".join(chunks)
         if raw:
             logger.debug(
