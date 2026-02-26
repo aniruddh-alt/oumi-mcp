@@ -146,8 +146,6 @@ class PreFlightCheckResponse(TypedDict):
             "ok_remote", "not_found_warning", or "local_machine_path_error".
         dataset_checks: Per-dataset validation results (e.g. "ok", "not_found",
             "warning_timeout"). Only present when datasets are found in config.
-        env_warnings: Warnings about environment variable overrides that may
-            silently change behavior (e.g. OUMI_USE_SPOT_VM).
         suggested_configs: Relative config paths relevant to the model in this config.
             Only present when ``cloud`` was specified. Pass these to ``get_config()``
             to retrieve full YAML examples for reference or adaptation.
@@ -167,7 +165,6 @@ class PreFlightCheckResponse(TypedDict):
     warnings: list[str]
     paths: dict[str, str]
     dataset_checks: NotRequired[dict[str, str]]
-    env_warnings: NotRequired[list[str]]
     suggested_configs: NotRequired[list[str]]
     cloud_file_checks: NotRequired[dict[str, str]]
 

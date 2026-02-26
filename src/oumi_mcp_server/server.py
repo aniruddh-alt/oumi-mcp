@@ -21,7 +21,6 @@ import dataclasses
 import json
 import logging
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -698,9 +697,6 @@ def _pre_flight_check(
         elif ds_status == "warning_timeout":
             warnings.append(f"HF Hub probe for dataset '{ds_key}' timed out (5s)")
 
-    env_warnings = _check_env_overrides(target_cloud)
-    warnings.extend(env_warnings)
-
     path_results = validate_paths(cfg, Path(client_cwd), cloud=target_cloud)
     for path_key, path_status in path_results.items():
         if path_status == "local_machine_path_error":
@@ -708,6 +704,12 @@ def _pre_flight_check(
                 f"Local machine path '{path_key}' will not exist on the remote VM. "
                 "Use a repo-relative path (e.g., 'data/...') that resolves from "
                 "your working_dir."
+            )
+        elif path_status == "not_found_warning":
+            warnings.append(
+                f"Path '{path_key}' not found locally. "
+                "Verify it will be available on the VM via file_mounts, "
+                "working_dir, or setup_script."
             )
 
     if target_cloud:
@@ -767,14 +769,24 @@ def _pre_flight_check(
 
     if dataset_checks:
         result["dataset_checks"] = dataset_checks
-    if env_warnings:
-        result["env_warnings"] = env_warnings
     if cloud_file_checks:
         result["cloud_file_checks"] = cloud_file_checks
 
     if target_cloud:
         all_cfgs = get_all_configs()
-        suggested = search_configs_service(all_cfgs, query=target_cloud, limit=5)
+        # Use task type from config for relevant suggestions, not cloud name
+        task_type = cfg.get("task_type", "") or ""
+        if not task_type:
+            # Infer from config keys
+            if cfg.get("training"):
+                task_type = "sft"
+            elif cfg.get("evaluation") or cfg.get("tasks"):
+                task_type = "eval"
+            elif cfg.get("generation") and cfg.get("input_path"):
+                task_type = "infer"
+        suggested = search_configs_service(
+            all_cfgs, task=task_type or "sft", limit=5
+        )
         result["suggested_configs"] = [c["path"] for c in suggested]
 
     return result
@@ -925,26 +937,6 @@ def validate_datasets(cfg: dict, client_cwd: str = "") -> dict[str, str]:
             results[key] = "not_found"
 
     return results
-
-
-def _check_env_overrides(cloud: str) -> list[str]:
-    """Check for environment variables that silently override config behavior.
-
-    Only relevant for cloud jobs. ``OUMI_USE_SPOT_VM`` and
-    ``OUMI_FORCE_EDITABLE_INSTALL`` are stripped at startup by
-    ``_strip_oumi_env_overrides()`` so they won't appear here.
-    """
-    if not cloud or cloud == "local":
-        return []
-
-    warnings: list[str] = []
-    _ENV_WARNINGS: dict[str, str] = {}
-    for var, msg in _ENV_WARNINGS.items():
-        val = os.environ.get(var)
-        if val:
-            warnings.append(f"Env var {var}={val!r} is set: {msg}")
-
-    return warnings
 
 
 def _check_skyignore(config_dir: Path, path_results: dict[str, str]) -> list[str]:
