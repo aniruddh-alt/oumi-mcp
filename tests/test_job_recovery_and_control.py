@@ -34,7 +34,6 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 cluster_name="cluster-a",
                 oumi_job_id="sky-job-123",
                 model_name="meta-llama/Llama-3.1-8B-Instruct",
-                status="running",
                 submit_time=recent,
             )
             reg1.add(record)
@@ -61,7 +60,6 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 cluster_name="c",
                 oumi_job_id="1",
                 model_name="m",
-                status="failed",
                 submit_time="2020-01-01T00:00:00+00:00",
             ))
             reg.add(JobRecord(
@@ -72,7 +70,6 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 cluster_name="c",
                 oumi_job_id="2",
                 model_name="m",
-                status="completed",
                 submit_time=datetime.now(timezone.utc).isoformat(),
             ))
 
@@ -232,13 +229,10 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             cluster_name="",
             oumi_job_id="",
             model_name="",
-            status="running",
             submit_time="2026-02-12T17:09:25+00:00",
         )
         rt = JobRuntime()
-        with patch("oumi_mcp_server.job_service.get_registry") as mock_registry:
-            mock_registry.return_value.update = lambda *a, **kw: None
-            response = await job_service.cancel(record, rt)
+        response = await job_service.cancel(record, rt)
         self.assertTrue(response["success"])
         self.assertTrue(rt.cancel_requested)
 
@@ -254,7 +248,6 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 cluster_name="",
                 oumi_job_id="",
                 model_name="",
-                status="running",
                 submit_time="2026-02-20T00:00:01+00:00",
             )
             rt = JobRuntime()
@@ -302,7 +295,6 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 cluster_name="",
                 oumi_job_id="",
                 model_name="",
-                status="running",
                 submit_time="2026-02-20T00:00:02+00:00",
             )
             rt = JobRuntime()
@@ -485,15 +477,12 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             cluster_name="",
             oumi_job_id="",
             model_name="",
-            status="running",
             submit_time="2026-02-12T17:09:25+00:00",
         )
         rt = JobRuntime()
         mock_task = asyncio.Future()
         rt.runner_task = mock_task  # type: ignore[assignment]
-        with patch("oumi_mcp_server.job_service.get_registry") as mock_registry:
-            mock_registry.return_value.update = lambda *a, **kw: None
-            result = await cancel(record, rt)
+        result = await cancel(record, rt)
         self.assertTrue(result["success"])
         self.assertTrue(mock_task.cancelled())
 

@@ -16,12 +16,11 @@ class TestJobRecord(unittest.TestCase):
             cluster_name="cluster-a",
             oumi_job_id="sky-123",
             model_name="meta-llama/Llama-3.1-8B",
-            status="running",
             submit_time="2026-02-24T12:00:00Z",
         )
         for field_name in ["job_id", "command", "config_path", "cloud",
                            "cluster_name", "oumi_job_id", "model_name",
-                           "status", "submit_time"]:
+                           "submit_time"]:
             self.assertIsInstance(getattr(r, field_name), str)
 
 
@@ -42,7 +41,7 @@ class TestJobRegistry(unittest.TestCase):
             r = JobRecord(
                 job_id="j1", command="train", config_path="/tmp/t.yaml",
                 cloud="local", cluster_name="", oumi_job_id="123",
-                model_name="test", status="running",
+                model_name="test",
                 submit_time="2026-02-24T00:00:00Z",
             )
             reg.add(r)
@@ -55,7 +54,7 @@ class TestJobRegistry(unittest.TestCase):
             r = JobRecord(
                 job_id="j1", command="train", config_path="/tmp/t.yaml",
                 cloud="gcp", cluster_name="c1", oumi_job_id="sky-1",
-                model_name="test", status="running",
+                model_name="test",
                 submit_time="2026-02-24T00:00:00Z",
             )
             reg.add(r)
@@ -73,12 +72,11 @@ class TestJobRegistry(unittest.TestCase):
             r = JobRecord(
                 job_id="j1", command="train", config_path="/tmp/t.yaml",
                 cloud="local", cluster_name="", oumi_job_id="",
-                model_name="test", status="running",
+                model_name="test",
                 submit_time="2026-02-24T00:00:00Z",
             )
             reg.add(r)
-            reg.update("j1", status="completed", oumi_job_id="456")
-            self.assertEqual(reg.get("j1").status, "completed")
+            reg.update("j1", oumi_job_id="456")
             self.assertEqual(reg.get("j1").oumi_job_id, "456")
 
     def test_remove(self):
@@ -88,7 +86,7 @@ class TestJobRegistry(unittest.TestCase):
             r = JobRecord(
                 job_id="j1", command="train", config_path="/tmp/t.yaml",
                 cloud="local", cluster_name="", oumi_job_id="",
-                model_name="test", status="running",
+                model_name="test",
                 submit_time="2026-02-24T00:00:00Z",
             )
             reg.add(r)
@@ -105,7 +103,7 @@ class TestJobRegistry(unittest.TestCase):
             r = JobRecord(
                 job_id="j1", command="train", config_path="/tmp/t.yaml",
                 cloud="gcp", cluster_name="c1", oumi_job_id="sky-99",
-                model_name="test", status="running",
+                model_name="test",
                 submit_time="2026-02-24T00:00:00Z",
             )
             reg.add(r)
@@ -121,7 +119,7 @@ class TestJobRegistry(unittest.TestCase):
                 reg.add(JobRecord(
                     job_id=f"j{i}", command="train", config_path="/tmp/t.yaml",
                     cloud="local", cluster_name="", oumi_job_id=str(i),
-                    model_name="test", status="running",
+                    model_name="test",
                     submit_time="2026-02-24T00:00:00Z",
                 ))
             self.assertEqual(len(reg.all()), 3)

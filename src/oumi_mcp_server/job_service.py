@@ -47,7 +47,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class JobRecord:
-    """Persisted job metadata. All fields are strings for simple JSON serde."""
+    """Persisted job metadata — identity mapping only.
+
+    All fields are strings for simple JSON serde.
+    The registry does NOT store job status; status is always
+    queried live from ``oumi.launcher.status()`` (cloud) or
+    ``rt.process.poll()`` (local).
+    """
 
     job_id: str
     command: str
@@ -56,8 +62,8 @@ class JobRecord:
     cluster_name: str
     oumi_job_id: str
     model_name: str
-    status: str  # "running", "completed", "failed"
     submit_time: str  # ISO 8601
+    output_dir: str = ""
 
 
 @dataclass

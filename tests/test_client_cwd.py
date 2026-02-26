@@ -142,7 +142,6 @@ class LocalJobCwdTests(unittest.TestCase):
                 cluster_name="",
                 oumi_job_id="",
                 model_name="gpt2",
-                status="running",
                 submit_time="2026-01-01T00:00:00Z",
             )
             rt = JobRuntime()
@@ -184,7 +183,6 @@ class CloudJobConfigPassthroughCwdTests(unittest.IsolatedAsyncioTestCase):
                 cluster_name="",
                 oumi_job_id="",
                 model_name="gpt2",
-                status="running",
                 submit_time="2026-01-01T00:00:00Z",
             )
             rt = JobRuntime()
