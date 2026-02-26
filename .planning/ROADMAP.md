@@ -18,13 +18,14 @@
 **Summary:** `.planning/phases/01-registry-refactor/01-SUMMARY.md`
 **Dependencies:** None (foundation layer)
 
-### Phase 2: Server Bug Fixes (server.py)
+### Phase 2: Server Bug Fixes (server.py) ✓ COMPLETE
 **Goal:** Fix validate_datasets CWD bug, surface not_found_warning, fix suggested_configs, remove dead code.
 
-**Tasks:** 2
-9. Fix validate_datasets CWD (add client_cwd parameter)
-10. Surface not_found_warning + fix suggested_configs + remove dead code
+**Tasks:** 2/2 complete
+9. ✓ Fix validate_datasets CWD (add client_cwd parameter)
+10. ✓ Surface not_found_warning + fix suggested_configs + remove dead code
 
+**Summary:** `.planning/phases/02-server-bug-fixes/02-01-SUMMARY.md`
 **Dependencies:** Phase 1 (server changes build on new registry)
 
 ### Phase 3: Guidance Content (mle_prompt.py)

@@ -5,12 +5,12 @@
 Making launcher.status() the source of truth for job state.
 
 ## Current Position
-- Phase: 1 of 4 — Registry Refactor
-- Plan: 1 of 1 complete (phase 1 done)
-- Status: Phase 1 complete, ready for Phase 2
+- Phase: 2 of 4 — Server Bug Fixes
+- Plan: 1 of 1 complete (phase 2 done)
+- Status: Phase 2 complete, ready for Phase 3
 
 ## Progress
-[██░░░░░░░░] 25% — Phase 1 of 4 complete (8 tasks done)
+[████░░░░░░] 50% — Phase 2 of 4 complete (10 tasks done)
 
 ## Recent Decisions
 - Cohesive refactor (not surgical fixes) for cancel/runtime
@@ -22,6 +22,10 @@ Making launcher.status() the source of truth for job state.
 - Legacy 'status' field in persisted JSON is silently popped on load for backward compat
 - _list_job_summaries queries launcher.status() for cloud jobs directly, not registry
 - cancel_job polls live status before cancelling to avoid redundant cloud API calls
+- validate_datasets accepts client_cwd param, resolves relative paths there
+- not_found_warning from validate_paths surfaced as user-facing warning
+- suggested_configs uses task_type inferred from config keys, falls back to sft
+- _check_env_overrides deleted: function body was empty (_ENV_WARNINGS = {}), always returned []
 
 ## Pending Todos
 None
@@ -30,5 +34,5 @@ None
 None
 
 ## Session Continuity
-Last session: 2026-02-26 — Phase 1 registry refactor executed (8 tasks, all tests passing)
-Stopped at: Phase 1 Plan 1 complete — ready for Phase 2 (server-level bug fixes)
+Last session: 2026-02-26 — Phase 2 server bug fixes executed (2 tasks, all tests passing)
+Stopped at: Phase 2 Plan 1 complete — ready for Phase 3 (guidance content)
