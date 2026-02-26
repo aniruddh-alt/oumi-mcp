@@ -201,6 +201,26 @@ def get_runtime(job_id: str) -> JobRuntime:
     return _runtimes[job_id]
 
 
+def evict_runtime(job_id: str) -> None:
+    """Remove a runtime entry, closing any open handles."""
+    rt = _runtimes.pop(job_id, None)
+    if rt is None:
+        return
+    rt.close_log_files()
+    if rt.runner_task and not rt.runner_task.done():
+        rt.runner_task.cancel()
+
+
+def cleanup_stale_runtimes() -> None:
+    """Remove runtime entries whose job_id is no longer in the registry."""
+    reg = get_registry()
+    stale = [jid for jid in _runtimes if reg.get(jid) is None]
+    for jid in stale:
+        evict_runtime(jid)
+    if stale:
+        logger.info("Evicted %d stale runtime entries", len(stale))
+
+
 _registry: JobRegistry | None = None
 
 
