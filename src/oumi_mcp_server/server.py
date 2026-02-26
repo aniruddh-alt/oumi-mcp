@@ -1983,8 +1983,8 @@ async def run_oumi_job(
         cluster_name=cluster_name,
         oumi_job_id="",
         model_name=model_name,
-        status="running",
         submit_time=submit_time,
+        output_dir=output_dir,
     )
     reg = get_registry()
     reg.add(record)
@@ -1999,7 +1999,6 @@ async def run_oumi_job(
             start_local_job(record, rt, client_cwd=client_cwd)
         except Exception as exc:
             rt.error_message = str(exc)
-            reg.update(record.job_id, status="failed")
             return _error_response(
                 f"Failed to start job: {exc}",
                 job_id=job_id,
@@ -2096,35 +2095,42 @@ async def run_oumi_job(
 def _job_status_str(record: JobRecord, rt: JobRuntime) -> str:
     """Derive a human-readable status string for any job (local or cloud)."""
     if rt.cancel_requested:
-        return "cancel_requested"
+        return "cancelled"
     is_local = record.cloud == "local"
     if is_local:
         proc = rt.process
         if proc is None:
-            if record.status in {"running", "launching"}:
+            if rt.error_message:
+                return "failed"
+            # Still launching (runner_task exists but process not spawned yet)
+            if rt.runner_task and not rt.runner_task.done():
                 return "launching"
-            return "failed" if rt.error_message else record.status
+            return "unknown"
         rc = proc.poll()
         if rc is None:
             return "running"
-        if rt.error_message and "Cancelled" in rt.error_message:
-            return "cancelled"
         return "completed" if rc == 0 else "failed"
+    # Cloud job — use launcher status
     if rt.oumi_status:
         return rt.oumi_status.status
     if rt.error_message:
         return "failed"
-    return record.status
+    # No oumi_job_id yet — still launching
+    if not record.oumi_job_id:
+        return "launching"
+    return "unknown"
 
 
 def _is_job_done(record: JobRecord, rt: JobRuntime) -> bool:
     """Return True if the job is in a terminal state."""
-    if record.status in {"completed", "failed"}:
-        return True
     is_local = record.cloud == "local"
     if is_local and rt.process is not None:
         return rt.process.poll() is not None
     if rt.oumi_status and rt.oumi_status.done:
+        return True
+    if rt.error_message and not rt.runner_task:
+        return True
+    if rt.cancel_requested:
         return True
     return False
 
@@ -2327,32 +2333,61 @@ def _read_log_tail(stdout_path: Path, lines: int) -> tuple[str, int]:
 
 
 async def _list_job_summaries(status_filter: str = "all") -> list[JobSummary]:
-    """Build normalized job summaries for tools and resources."""
+    """Build job summaries from launcher (cloud) and registry (local)."""
     reg = get_registry()
-    records = reg.all()
-    if records:
-        await asyncio.gather(
-            *(poll_status(r, get_runtime(r.job_id)) for r in records),
-            return_exceptions=True,
-        )
+    summaries: list[JobSummary] = []
 
-    if status_filter == "running":
-        records = [r for r in records if not _is_job_done(r, get_runtime(r.job_id))]
-    elif status_filter == "completed":
-        records = [r for r in records if _is_job_done(r, get_runtime(r.job_id))]
+    # Cloud jobs: query launcher for live state
+    try:
+        all_statuses = await asyncio.to_thread(launcher.status)
+        for cloud_name, jobs in all_statuses.items():
+            for job_status in jobs:
+                # Try to find MCP job ID from registry
+                mapping = reg.find_by_cloud_identity(cloud_name, job_status.id)
+                mcp_id = mapping.job_id if mapping else ""
+                model = mapping.model_name if mapping else ""
+                cmd = mapping.command if mapping else ""
 
-    return [
-        {
-            "job_id": r.job_id,
-            "command": r.command,
-            "status": _job_status_str(r, get_runtime(r.job_id)),
-            "cloud": r.cloud,
-            "cluster": r.cluster_name,
-            "model_name": r.model_name,
-            "is_done": _is_job_done(r, get_runtime(r.job_id)),
-        }
-        for r in records
-    ]
+                is_done = bool(job_status.done)
+                if status_filter == "running" and is_done:
+                    continue
+                if status_filter == "completed" and not is_done:
+                    continue
+
+                summaries.append({
+                    "job_id": mcp_id or job_status.id,
+                    "command": cmd,
+                    "status": job_status.status,
+                    "cloud": cloud_name,
+                    "cluster": job_status.cluster,
+                    "model_name": model,
+                    "is_done": is_done,
+                })
+    except Exception:
+        logger.warning("launcher.status failed; falling back to registry only", exc_info=True)
+
+    # Local jobs: check from registry + runtime
+    for record in reg.all():
+        if record.cloud != "local":
+            continue
+        rt = get_runtime(record.job_id)
+        status_str = _job_status_str(record, rt)
+        is_done = _is_job_done(record, rt)
+        if status_filter == "running" and is_done:
+            continue
+        if status_filter == "completed" and not is_done:
+            continue
+        summaries.append({
+            "job_id": record.job_id,
+            "command": record.command,
+            "status": status_str,
+            "cloud": "local",
+            "cluster": "local",
+            "model_name": record.model_name,
+            "is_done": is_done,
+        })
+
+    return summaries
 
 
 @mcp.tool()
