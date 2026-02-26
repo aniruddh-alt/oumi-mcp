@@ -570,6 +570,27 @@ pip install uv && uv pip install --system 'oumi[gpu,evaluation]'
 1. Check the dry-run output — it shows the resolved `working_dir` and generated job config
 2. Run `git status` in your project — untracked files won't sync
 3. Verify paths in your training config are repo-relative, not absolute local paths
+
+## Important: Ephemeral Storage
+
+Training outputs on the cluster's local disk are **not preserved** across cluster stops
+or recreations. If the cluster is stopped, restarted, or torn down, all local files
+(checkpoints, adapters, logs) are lost.
+
+**Before stopping or deleting a cluster:**
+1. Use `sky rsync-down <cluster> ~/sky_workdir/<output_dir> ./local_output/` to download artifacts
+2. Or configure your training config to save checkpoints to a cloud bucket (S3/GCS) via `storage_mounts`
+
+## Important: Existing Clusters and File Sync
+
+When submitting a job to an **existing** cluster, SkyPilot uses `sky exec` instead of
+`sky launch`. This means:
+- Local file changes are **NOT re-synced** to the VM
+- The VM still has the files from the original `sky launch`
+
+**If you edited files locally and need them on the VM:**
+- Use `sky launch` with the same `cluster_name` to force a full re-sync
+- Or use explicit `file_mounts` for files that change between submissions
 """
 
 POST_TRAINING_RESOURCE = """# Post-Training Guide — What To Do After Cloud Training Succeeds
