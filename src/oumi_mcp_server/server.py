@@ -2397,7 +2397,6 @@ async def get_job_logs(
                 cluster_name=cluster_name,
                 oumi_job_id=oumi_job_id,
                 model_name="",
-                status="unknown",
                 submit_time="",
             )
             cloud_result = await _get_cloud_logs(ephemeral, JobRuntime(), lines)

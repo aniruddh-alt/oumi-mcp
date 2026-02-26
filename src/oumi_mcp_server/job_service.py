@@ -633,7 +633,7 @@ def start_local_job(
     rt.process = proc
     record.oumi_job_id = str(proc.pid)
     get_registry().update(
-        record.job_id, oumi_job_id=record.oumi_job_id, status="running"
+        record.job_id, oumi_job_id=record.oumi_job_id
     )
     rt.stdout_f = stdout_f
     rt.stderr_f = stderr_f
@@ -648,8 +648,8 @@ def start_local_job(
 async def wait_local_completion(record: JobRecord, rt: JobRuntime) -> None:
     """Await completion of a local job subprocess.
 
-    Waits for the process to exit (in a thread) and updates
-    ``record.status`` via the registry on completion.
+    Waits for the process to exit (in a thread) and sets ``rt.error_message``
+    on failure.  Status is derived at runtime from ``rt.process.poll()``.
     """
     proc = rt.process
     if proc is None:
@@ -669,16 +669,13 @@ async def wait_local_completion(record: JobRecord, rt: JobRuntime) -> None:
             rt.error_message = f"Process exited with code {returncode}." + (
                 f" See stderr: {stderr_path}" if stderr_path else ""
             )
-            get_registry().update(record.job_id, status="failed")
             logger.warning(
                 "Local job %s exited with code %d", record.job_id, returncode
             )
         else:
-            get_registry().update(record.job_id, status="completed")
             logger.info("Local job %s completed successfully", record.job_id)
     except Exception as exc:
         rt.error_message = str(exc)
-        get_registry().update(record.job_id, status="failed")
         logger.exception("Failed to run local job %s", record.job_id)
     finally:
         rt.close_log_files()
@@ -717,7 +714,6 @@ async def _launch_cloud(
     initial status.  On failure, sets ``rt.error_message``.
     """
     reg = get_registry()
-    reg.update(record.job_id, status="launching")
 
     try:
         config_path = Path(record.config_path)
@@ -773,11 +769,12 @@ async def _launch_cloud(
         oumi_job_id = status.id if status else ""
         rt.oumi_status = status
         cluster_name = status.cluster if status else record.cluster_name
+
+        # Update registry with cloud identity (no status field)
         reg.update(
             record.job_id,
             oumi_job_id=oumi_job_id,
             cluster_name=cluster_name,
-            status="running",
         )
         record = reg.get(record.job_id) or record
         logger.info(
@@ -786,6 +783,9 @@ async def _launch_cloud(
             record.cloud,
             record.oumi_job_id,
         )
+
+        # Race guard: if cancel was requested while launcher.up was in-flight,
+        # immediately cancel the cloud job now that we have an oumi_job_id.
         if rt.cancel_requested and record.oumi_job_id:
             try:
                 result_status = await asyncio.to_thread(
@@ -795,15 +795,19 @@ async def _launch_cloud(
                     record.cluster_name,
                 )
                 rt.oumi_status = result_status
-                reg.update(record.job_id, status="failed")
             except Exception as cancel_exc:
                 rt.error_message = (
                     "Cancellation was requested during launch, but automatic "
                     f"cloud cancellation failed: {cancel_exc}"
                 )
+            # Evict cloud runtime after reconciliation — launcher is source of truth now
+            evict_runtime(record.job_id)
+            return
+
+        # Cloud launch succeeded — evict runtime (launcher.status is source of truth)
+        evict_runtime(record.job_id)
     except Exception as exc:
         rt.error_message = str(exc)
-        reg.update(record.job_id, status="failed")
         logger.exception("Failed to launch cloud job %s", record.job_id)
 
 
@@ -927,48 +931,35 @@ async def cancel(
 ) -> JobCancelResponse:
     """Cancel a job.
 
-    For **local** jobs, sends SIGTERM (or SIGKILL if *force* is True)
-    to the subprocess.  For **cloud** jobs, delegates to
-    ``oumi.launcher.cancel()``.
-
-    Returns a dict with ``success`` (bool) and ``message`` or ``error``.
+    For **local** jobs, sends SIGTERM (or SIGKILL if *force* is True).
+    For **cloud** jobs, delegates to ``oumi.launcher.cancel()``.
     """
-    reg = get_registry()
-
-    if record.status in {"completed", "failed"}:
-        return {
-            "success": False,
-            "error": (
-                f"Job {record.job_id} is already finished "
-                f"(status: {rt.oumi_status.status if rt.oumi_status else record.status})"
-            ),
-        }
-
+    # Pre-launch cancel: job hasn't reached the cloud yet
     if not record.oumi_job_id and rt.process is None:
         rt.cancel_requested = True
         rt.error_message = "Cancellation requested while launch is pending."
-        reg.update(record.job_id, status="failed")
         if rt.runner_task and not rt.runner_task.done():
             rt.runner_task.cancel()
         return {
             "success": True,
             "message": (
                 f"Cancellation requested for {record.job_id}. "
-                "If the cloud launch completes, the MCP will attempt best-effort cancellation."
+                "If the cloud launch completes, the MCP will attempt "
+                "best-effort cancellation."
             ),
         }
 
+    # Local job cancel
     if record.cloud == "local" and rt.process is not None:
         try:
             if force:
-                rt.process.kill()  # SIGKILL
+                rt.process.kill()
                 action = "killed (SIGKILL)"
             else:
-                rt.process.terminate()  # SIGTERM
+                rt.process.terminate()
                 action = "terminated (SIGTERM)"
             rt.cancel_requested = True
             rt.error_message = f"Cancelled by user ({action})"
-            reg.update(record.job_id, status="failed")
             logger.info("Local job %s %s", record.job_id, action)
             return {
                 "success": True,
@@ -980,6 +971,7 @@ async def cancel(
                 "error": f"Failed to cancel local job {record.job_id}: {exc}",
             }
 
+    # Cloud job cancel — delegate to launcher
     try:
         result_status = await asyncio.to_thread(
             launcher.cancel,
@@ -989,10 +981,12 @@ async def cancel(
         )
         rt.cancel_requested = True
         rt.oumi_status = result_status
-        reg.update(record.job_id, status="failed")
         return {
             "success": True,
-            "message": f"Job {record.job_id} cancel requested on {record.cloud}/{record.cluster_name}.",
+            "message": (
+                f"Job {record.job_id} cancel requested on "
+                f"{record.cloud}/{record.cluster_name}."
+            ),
         }
     except Exception as exc:
         return {
