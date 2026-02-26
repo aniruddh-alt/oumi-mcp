@@ -686,7 +686,7 @@ def _pre_flight_check(
     errors.extend(cloud_errors)
     warnings.extend(cloud_warnings)
 
-    dataset_checks = validate_datasets(cfg)
+    dataset_checks = validate_datasets(cfg, client_cwd=client_cwd)
     for ds_key, ds_status in dataset_checks.items():
         if ds_status == "not_found":
             errors.append(
@@ -858,12 +858,12 @@ def validate_paths(cfg: dict, base_dir: Path, *, cloud: str = "") -> dict[str, s
     return paths
 
 
-def validate_datasets(cfg: dict) -> dict[str, str]:
+def validate_datasets(cfg: dict, client_cwd: str = "") -> dict[str, str]:
     """Validate dataset accessibility for each dataset in the config.
 
     Mirrors Oumi's dataset resolution chain:
     1. REGISTRY.get_dataset(name) → found in registry
-    2. dataset_path set → check local existence
+    2. dataset_path set → check local existence (resolved against client_cwd)
     3. datasets.load_dataset_builder(name) → HF Hub metadata probe (no download)
 
     Returns a dict mapping dataset identifiers to status strings:
@@ -872,6 +872,7 @@ def validate_datasets(cfg: dict) -> dict[str, str]:
     """
     data = cfg.get("data") or {}
     results: dict[str, str] = {}
+    base_dir = Path(client_cwd) if client_cwd else Path.cwd()
 
     for split in ("train", "eval", "validation", "test"):
         split_cfg = data.get(split) or {}
@@ -900,6 +901,8 @@ def validate_datasets(cfg: dict) -> dict[str, str]:
 
             if ds_path:
                 p = Path(ds_path).expanduser()
+                if not p.is_absolute():
+                    p = (base_dir / p).resolve()
                 if p.exists():
                     results[key] = "ok_local"
                     continue
