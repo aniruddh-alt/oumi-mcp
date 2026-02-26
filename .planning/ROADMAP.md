@@ -28,13 +28,14 @@
 **Summary:** `.planning/phases/02-server-bug-fixes/02-01-SUMMARY.md`
 **Dependencies:** Phase 1 (server changes build on new registry)
 
-### Phase 3: Guidance Content (mle_prompt.py)
+### Phase 3: Guidance Content (mle_prompt.py) ✓ COMPLETE
 **Goal:** Address user friction points from Issue #2 with better documentation.
 
-**Tasks:** 2
-11. Add ephemeral storage + sky exec warnings to CLOUD_LAUNCH_RESOURCE
-12. Add version compat, inference output schema, eval caveats
+**Tasks:** 2/2 complete
+11. ✓ Add ephemeral storage + sky exec warnings to CLOUD_LAUNCH_RESOURCE
+12. ✓ Add version compat, inference output schema, eval caveats
 
+**Summary:** `.planning/phases/03-guidance-content/03-01-SUMMARY.md`
 **Dependencies:** None (independent of code changes, but sequenced after Phase 1 for clean commits)
 
 ### Phase 4: Tests
