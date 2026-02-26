@@ -497,6 +497,163 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             make_job_id("train", job_name="../../..")
 
+    # -- Task 16: cancel_job end-to-end + cancel timeout --
+
+    async def test_cancel_job_delegates_to_launcher_cancel(self) -> None:
+        """cancel_job calls launcher.cancel with the correct arguments."""
+        with (
+            patch("oumi_mcp_server.server._resolve_job_record", return_value=None),
+            patch(
+                "oumi_mcp_server.server.launcher.cancel", return_value=None
+            ) as mock_cancel,
+        ):
+            response = await server.cancel_job(
+                job_id="",
+                oumi_job_id="sky-job-456",
+                cloud="aws",
+                cluster_name="cluster-b",
+            )
+
+        self.assertTrue(response["success"])
+        mock_cancel.assert_called_once_with("sky-job-456", "aws", "cluster-b")
+
+    async def test_cancel_job_timeout_returns_structured_error(self) -> None:
+        """cancel_job returns a structured timeout error when launcher.cancel hangs."""
+        import asyncio as _asyncio
+
+        async def _fake_wait_for(coro, timeout):  # noqa: ANN001, ANN202
+            # Consume the coroutine (close it cleanly) then raise TimeoutError
+            try:
+                coro.close()
+            except Exception:
+                pass
+            raise _asyncio.TimeoutError()
+
+        with (
+            patch("oumi_mcp_server.server._resolve_job_record", return_value=None),
+            patch("oumi_mcp_server.server.asyncio.wait_for", side_effect=_fake_wait_for),
+        ):
+            response = await server.cancel_job(
+                job_id="",
+                oumi_job_id="sky-job-789",
+                cloud="gcp",
+                cluster_name="cluster-c",
+            )
+
+        self.assertFalse(response["success"])
+        self.assertIn("timed out", response.get("error", ""))
+
+    # -- Task 17: _launch_cloud with client_cwd --
+
+    async def test_launch_cloud_client_cwd_sets_working_dir(self) -> None:
+        """For training-config wrapping, client_cwd becomes working_dir in job config."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            client_dir = Path(tmp_dir) / "project"
+            client_dir.mkdir()
+            cfg_path = Path(tmp_dir) / "train.yaml"
+            cfg_path.write_text("model: {model_name: test/model}\n", encoding="utf-8")
+            record = JobRecord(
+                job_id="train_20260220_000003_gh789",
+                command="train",
+                config_path=str(cfg_path),
+                cloud="gcp",
+                cluster_name="",
+                oumi_job_id="",
+                model_name="",
+                submit_time="2026-02-20T00:00:03+00:00",
+            )
+            rt = JobRuntime()
+            rt.run_dir = Path(tmp_dir) / "run"
+
+            captured_wd = {}
+
+            def _fake_up(job_cfg, cluster_name):  # noqa: ANN001
+                captured_wd["working_dir"] = job_cfg.working_dir
+                status = SimpleNamespace(
+                    id="cloud-789",
+                    cluster="cluster-x",
+                    done=False,
+                    status="RUNNING",
+                    state=SimpleNamespace(name="RUNNING"),
+                    metadata={},
+                )
+                return (SimpleNamespace(), status)
+
+            with patch("oumi_mcp_server.job_service.launcher.up", side_effect=_fake_up):
+                with patch("oumi_mcp_server.job_service.get_registry") as mock_registry:
+                    mock_registry.return_value.update = lambda *a, **kw: None
+                    mock_registry.return_value.get = lambda jid: record
+                    await job_service._launch_cloud(  # type: ignore[attr-defined]
+                        record, rt, client_cwd=str(client_dir), accelerators="A100:1"
+                    )
+
+            # Training-config wrapping: client_cwd should be passed as working_dir
+            self.assertEqual(captured_wd["working_dir"], str(client_dir))
+
+    # -- Task 18: list_jobs via launcher.status() --
+
+    async def test_list_jobs_calls_launcher_status(self) -> None:
+        """list_jobs queries launcher.status() and enriches results with MCP IDs."""
+        job_status = SimpleNamespace(
+            id="sky-job-001",
+            cluster="cluster-y",
+            done=False,
+            status="RUNNING",
+            state=SimpleNamespace(name="RUNNING"),
+            metadata={},
+        )
+
+        with (
+            patch(
+                "oumi_mcp_server.server.launcher.status",
+                return_value={"gcp": [job_status]},
+            ),
+            patch("oumi_mcp_server.server.get_registry") as mock_reg,
+        ):
+            mock_reg.return_value.find_by_cloud_identity.return_value = None
+            mock_reg.return_value.all.return_value = []
+            summaries = await server._list_job_summaries()
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["cloud"], "gcp")
+        self.assertEqual(summaries[0]["status"], "RUNNING")
+
+    async def test_list_jobs_enriches_with_mcp_job_id(self) -> None:
+        """list_jobs maps cloud identity to MCP job_id via registry lookup."""
+        job_status = SimpleNamespace(
+            id="sky-job-002",
+            cluster="cluster-z",
+            done=True,
+            status="SUCCEEDED",
+            state=SimpleNamespace(name="SUCCEEDED"),
+            metadata={},
+        )
+        mcp_record = JobRecord(
+            job_id="train_mcp_id",
+            command="train",
+            config_path="/tmp/t.yaml",
+            cloud="aws",
+            cluster_name="cluster-z",
+            oumi_job_id="sky-job-002",
+            model_name="meta-llama/Llama-3.1-8B",
+            submit_time="2026-02-20T00:00:04+00:00",
+        )
+
+        with (
+            patch(
+                "oumi_mcp_server.server.launcher.status",
+                return_value={"aws": [job_status]},
+            ),
+            patch("oumi_mcp_server.server.get_registry") as mock_reg,
+        ):
+            mock_reg.return_value.find_by_cloud_identity.return_value = mcp_record
+            mock_reg.return_value.all.return_value = []
+            summaries = await server._list_job_summaries()
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["job_id"], "train_mcp_id")
+        self.assertEqual(summaries[0]["model_name"], "meta-llama/Llama-3.1-8B")
+
 
 if __name__ == "__main__":
     unittest.main()
