@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from oumi_mcp_server.server import _check_cloud_files
+from oumi_mcp_server.server import _check_cloud_files, validate_datasets
 
 
 @pytest.fixture
@@ -230,3 +230,46 @@ class TestPreFlightIntegration:
         result = _pre_flight_check(str(config_yaml), client_cwd=str(tmp_path), cloud="aws")
         assert result["blocking"] is True
         assert any("no delivery mechanism" in e for e in result["errors"])
+
+
+# -- validate_datasets client_cwd --
+
+class TestValidateDatasetsClientCwd:
+    """Verify that validate_datasets resolves relative ds_path against client_cwd."""
+
+    def test_relative_ds_path_resolved_against_client_cwd(self, tmp_path: Path):
+        """A relative dataset_path should resolve under client_cwd and report ok_local."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "train.jsonl").write_text("{}\n")
+
+        cfg = {
+            "data": {
+                "train": {
+                    "datasets": [
+                        {"dataset_name": "", "dataset_path": "data/train.jsonl"}
+                    ]
+                }
+            }
+        }
+        result = validate_datasets(cfg, client_cwd=str(tmp_path))
+        assert result.get("data/train.jsonl") == "ok_local"
+
+    def test_relative_ds_path_not_found_without_client_cwd(self, tmp_path: Path):
+        """Without client_cwd, a relative path that only exists under tmp_path is not found."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "train.jsonl").write_text("{}\n")
+
+        cfg = {
+            "data": {
+                "train": {
+                    "datasets": [
+                        {"dataset_name": "", "dataset_path": "data/train.jsonl"}
+                    ]
+                }
+            }
+        }
+        # No client_cwd — resolves against cwd, not tmp_path, so not found
+        result = validate_datasets(cfg, client_cwd="")
+        assert result.get("data/train.jsonl") != "ok_local"
