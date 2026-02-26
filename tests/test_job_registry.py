@@ -137,6 +137,90 @@ class TestJobRegistry(unittest.TestCase):
             reg = JobRegistry(path)
             self.assertEqual(len(reg.all()), 0)
 
+    def test_prune_old(self):
+        """Records older than 7 days are pruned on load."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.json"
+            reg = JobRegistry(path)
+            reg.add(JobRecord(
+                job_id="old",
+                command="train",
+                config_path="/tmp/t.yaml",
+                cloud="gcp",
+                cluster_name="c",
+                oumi_job_id="1",
+                model_name="m",
+                submit_time="2020-01-01T00:00:00+00:00",
+            ))
+            reg.add(JobRecord(
+                job_id="new",
+                command="train",
+                config_path="/tmp/t.yaml",
+                cloud="gcp",
+                cluster_name="c",
+                oumi_job_id="2",
+                model_name="m",
+                submit_time="2099-01-01T00:00:00+00:00",
+            ))
+            reg2 = JobRegistry(path)
+            self.assertIsNone(reg2.get("old"))
+            self.assertIsNotNone(reg2.get("new"))
+
+    def test_update_persists(self):
+        """update() writes the change through to disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.json"
+            reg = JobRegistry(path)
+            reg.add(JobRecord(
+                job_id="j1",
+                command="train",
+                config_path="/tmp/t.yaml",
+                cloud="gcp",
+                cluster_name="",
+                oumi_job_id="",
+                model_name="m",
+                submit_time="2026-02-24T00:00:00Z",
+            ))
+            reg.update("j1", oumi_job_id="sky-42", cluster_name="cl-1")
+            reg2 = JobRegistry(path)
+            loaded = reg2.get("j1")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.oumi_job_id, "sky-42")
+            self.assertEqual(loaded.cluster_name, "cl-1")
+
+    def test_update_missing_noop(self):
+        """update() on an unknown job_id is a no-op (no crash, no record created)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.json"
+            reg = JobRegistry(path)
+            reg.update("nonexistent", oumi_job_id="sky-99")  # should not raise
+            self.assertIsNone(reg.get("nonexistent"))
+
+    def test_legacy_records_with_status(self):
+        """Legacy JSON records containing a 'status' field load without error."""
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.json"
+            legacy = [{
+                "job_id": "legacy-1",
+                "command": "train",
+                "config_path": "/tmp/t.yaml",
+                "cloud": "gcp",
+                "cluster_name": "cl",
+                "oumi_job_id": "sky-1",
+                "model_name": "m",
+                "submit_time": "2026-02-24T00:00:00+00:00",
+                "status": "RUNNING",   # legacy field — should be silently dropped
+            }]
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            reg = JobRegistry(path)
+            loaded = reg.get("legacy-1")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.job_id, "legacy-1")
+            self.assertFalse(hasattr(loaded, "status"))
+
 
 if __name__ == "__main__":
     unittest.main()
