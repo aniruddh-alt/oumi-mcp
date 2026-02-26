@@ -2626,6 +2626,19 @@ async def cancel_job(
         }
 
     rt = get_runtime(record.job_id)
+
+    # For cloud jobs, check live status first — the job may already be done
+    if record.cloud != "local" and record.oumi_job_id:
+        live = await poll_status(record, rt)
+        if live and live.done:
+            return {
+                "success": False,
+                "error": (
+                    f"Job {record.job_id} is already finished "
+                    f"(status: {live.status})"
+                ),
+            }
+
     return await cancel(record, rt, force=force)
 
 
