@@ -5,12 +5,12 @@
 Making launcher.status() the source of truth for job state.
 
 ## Current Position
-- Phase: 3 of 4 — Guidance Content
-- Plan: 1 of 1 complete (phase 3 done)
-- Status: Phase 3 complete, ready for Phase 4
+- Phase: 4 of 4 — Tests
+- Plan: 1 of 1 complete (phase 4 done)
+- Status: ALL PHASES COMPLETE
 
 ## Progress
-[██████░░░░] 75% — Phase 3 of 4 complete (12 tasks done)
+[██████████] 100% — Phase 4 of 4 complete (20 tasks done)
 
 ## Recent Decisions
 - Cohesive refactor (not surgical fixes) for cancel/runtime
@@ -29,6 +29,9 @@ Making launcher.status() the source of truth for job state.
 - Version compat note placed early in CLOUD_LAUNCH_RESOURCE so users see it before encountering issues
 - Eval + infer caveats use XML <caveats> tags consistent with resource format
 - Operational warnings (ephemeral storage, sky exec) use Markdown ## Important: headers
+- Task 15 already correct (training.output_dir uses _dir suffix, produces not_reachable_on_vm)
+- Cancel timeout test uses fake coroutine-closing wait_for to avoid ResourceWarning
+- Design doc update skipped per convention (don't commit design docs without explicit ask)
 
 ## Pending Todos
 None
@@ -37,5 +40,5 @@ None
 None
 
 ## Session Continuity
-Last session: 2026-02-26 — Phase 3 guidance content executed (2 tasks, all tests passing)
-Stopped at: Phase 3 Plan 1 complete — ready for Phase 4 (tests)
+Last session: 2026-02-26 — Phase 4 tests executed (11 new tests, 83 total passing)
+Stopped at: Phase 4 Plan 1 complete — all phases done
