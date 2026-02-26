@@ -93,18 +93,16 @@ class JobRuntime:
         self.stderr_f = None
 
 
-_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
-_MAX_TERMINAL_AGE_DAYS = 7
+_MAX_REGISTRY_AGE_DAYS = 7
 _MAX_REGISTRY_SIZE = 200
 _CLOUD_LOG_TIMEOUT = 30.0
 
 
 class JobRegistry:
-    """Single-file JSON registry of job records.
+    """Single-file JSON registry mapping MCP job IDs to cloud identities.
 
-    Evicts terminal jobs (completed/failed/cancelled) older than
-    ``_MAX_TERMINAL_AGE_DAYS`` on load. Caps total records at
-    ``_MAX_REGISTRY_SIZE``, dropping oldest terminal jobs first.
+    Evicts entries older than ``_MAX_REGISTRY_AGE_DAYS`` on load.
+    Caps total records at ``_MAX_REGISTRY_SIZE``, dropping oldest first.
     """
 
     def __init__(self, path: Path) -> None:
@@ -118,6 +116,8 @@ class JobRegistry:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             for entry in data:
+                # Handle legacy records that still have 'status' field
+                entry.pop("status", None)
                 r = JobRecord(**entry)
                 self._jobs[r.job_id] = r
         except Exception:
@@ -128,25 +128,11 @@ class JobRegistry:
             self._save()
 
     def _prune(self) -> int:
-        """Remove old terminal jobs and mark stale "running" jobs as failed."""
+        """Remove entries older than the age cutoff, then cap total size."""
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=_MAX_TERMINAL_AGE_DAYS)
-        removed = 0
-        for rec in self._jobs.values():
-            if rec.status not in _TERMINAL_STATUSES:
-                try:
-                    ts = datetime.fromisoformat(rec.submit_time)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    if ts < cutoff:
-                        rec.status = "failed"
-                except (ValueError, TypeError):
-                    rec.status = "failed"
-
+        cutoff = now - timedelta(days=_MAX_REGISTRY_AGE_DAYS)
         to_remove: list[str] = []
         for jid, rec in self._jobs.items():
-            if rec.status not in _TERMINAL_STATUSES:
-                continue
             try:
                 ts = datetime.fromisoformat(rec.submit_time)
                 if ts.tzinfo is None:
@@ -157,17 +143,13 @@ class JobRegistry:
                 to_remove.append(jid)
         for jid in to_remove:
             del self._jobs[jid]
-        removed += len(to_remove)
+        removed = len(to_remove)
 
+        # Cap total size — drop oldest first
         if len(self._jobs) > _MAX_REGISTRY_SIZE:
-            terminal = [
-                (jid, r)
-                for jid, r in self._jobs.items()
-                if r.status in _TERMINAL_STATUSES
-            ]
-            terminal.sort(key=lambda x: x[1].submit_time)
-            while len(self._jobs) > _MAX_REGISTRY_SIZE and terminal:
-                jid, _ = terminal.pop(0)
+            by_time = sorted(self._jobs.items(), key=lambda x: x[1].submit_time)
+            while len(self._jobs) > _MAX_REGISTRY_SIZE and by_time:
+                jid, _ = by_time.pop(0)
                 del self._jobs[jid]
                 removed += 1
 
@@ -185,7 +167,10 @@ class JobRegistry:
         self._save()
 
     def update(self, job_id: str, **fields: Any) -> None:
-        record = self._jobs[job_id]
+        record = self._jobs.get(job_id)
+        if record is None:
+            logger.warning("Registry.update: job_id %s not found, skipping", job_id)
+            return
         for k, v in fields.items():
             setattr(record, k, v)
         self._save()
