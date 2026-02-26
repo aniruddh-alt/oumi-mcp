@@ -331,6 +331,15 @@ EVAL_COMMAND_RESOURCE = """<resource>
 <outputs>
 <item>Metrics and run metadata in `output_dir` (e.g., task_result.json).</item>
 </outputs>
+
+<caveats>
+<item>lm_harness evaluation tasks may have version-specific compatibility with Oumi.
+If evaluation fails with dtype or model constructor errors, verify the installed oumi
+version matches task expectations, or fall back to a direct evaluation script.</item>
+<item>Config structure is consistent across model versions within a family (e.g. Qwen2.5
+and Qwen3 use the same config shape). If search_configs() doesn't return your exact model
+version, use a config from the same family as a template.</item>
+</caveats>
 </resource>
 """
 
@@ -347,6 +356,18 @@ is enough, cloud runs need additional information:
 - **storage_mounts**: Persistent cloud storage for outputs (important for spot instances)
 - **envs**: Environment variables (API keys, project names)
 - **resources**: Cloud provider, GPU type, disk size, spot/on-demand
+
+## Version Compatibility
+
+The MCP tools document Oumi 0.7 APIs. If the cloud VM installs a different version
+(e.g. `pip install oumi[gpu]` installs 0.1.x), some field names may differ:
+- `evaluation_backend` (0.7) → `evaluation_platform` (0.1.x)
+
+**To avoid mismatches:** pin the version in your setup script:
+```bash
+pip install 'oumi[gpu]>=0.7'
+```
+Or use `get_docs()` to check the installed version's API.
 
 ## How Path Resolution Works
 
@@ -733,5 +754,19 @@ INFER_COMMAND_RESOURCE = """<resource>
 <outputs>
 <item>Console responses (interactive) or JSONL outputs (batch).</item>
 </outputs>
+
+<output_format>
+<description>Each line in predictions.jsonl contains the full conversation history
+with the model's response appended as an assistant turn:</description>
+<example>{"messages": [{"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "2+2 equals 4."}]}</example>
+<note>The output is NOT just the raw prediction — it includes the full message history.
+Parse the last assistant message to extract the model's response.</note>
+</output_format>
+
+<caveats>
+<item>Config structure is consistent across model versions within a family. If
+search_configs() doesn't return your exact model version (e.g. Qwen2.5), use a config
+from the same family (e.g. Qwen3) as a template — the structure is identical.</item>
+</caveats>
 </resource>
 """
