@@ -850,43 +850,31 @@ async def launch_job(
 
 
 async def poll_status(record: JobRecord, rt: JobRuntime) -> OumiJobStatus | None:
-    """Fetch the latest status for a job.
+    """Fetch the latest status for a job from the launcher.
 
-    For **local** jobs, checks the subprocess return code directly.
-    For **cloud** jobs, tries ``cluster.get_job()`` first, then falls
-    back to ``launcher.status()``.
-
-    Returns an ``OumiJobStatus`` for cloud jobs, or ``None`` for local
-    jobs (status is derived from ``rt.process`` instead).
+    For **local** jobs, returns None (status derived from ``rt.process``).
+    For **cloud** jobs, queries the cluster or launcher and updates ``rt.oumi_status``.
     """
     if record.cloud == "local":
         return None
 
-    reg = get_registry()
-
     if rt.error_message and rt.cluster_obj is None:
         return rt.oumi_status
 
-    def _derive_status(status: OumiJobStatus) -> str:
-        if not status.done:
-            return "running"
-        status_str = (status.status or "").lower()
-        if "fail" in status_str:
-            return "failed"
-        if "cancel" in status_str:
-            return "failed"
-        return "completed"
-
+    # Try cluster.get_job first (fastest path)
     if rt.cluster_obj and record.oumi_job_id:
         try:
-            status = await asyncio.to_thread(rt.cluster_obj.get_job, record.oumi_job_id)
+            status = await asyncio.to_thread(
+                rt.cluster_obj.get_job, record.oumi_job_id
+            )
             if status:
                 rt.oumi_status = status
+                # Update registry with cloud identity if it changed
+                reg = get_registry()
                 reg.update(
                     record.job_id,
                     oumi_job_id=status.id or record.oumi_job_id,
                     cluster_name=status.cluster or record.cluster_name,
-                    status=_derive_status(status),
                 )
                 return status
         except Exception:
@@ -896,6 +884,7 @@ async def poll_status(record: JobRecord, rt: JobRuntime) -> OumiJobStatus | None
                 exc_info=True,
             )
 
+    # Fallback: launcher.status (works even without a cluster object)
     try:
         if not record.oumi_job_id:
             return rt.oumi_status
@@ -909,11 +898,11 @@ async def poll_status(record: JobRecord, rt: JobRuntime) -> OumiJobStatus | None
             for s in jobs:
                 if s.id == record.oumi_job_id:
                     rt.oumi_status = s
+                    reg = get_registry()
                     reg.update(
                         record.job_id,
                         oumi_job_id=s.id or record.oumi_job_id,
                         cluster_name=s.cluster or record.cluster_name,
-                        status=_derive_status(s),
                     )
                     return s
     except Exception:
