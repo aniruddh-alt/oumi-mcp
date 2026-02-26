@@ -27,7 +27,7 @@ import subprocess
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -87,8 +87,19 @@ class JobRuntime:
         self.stderr_f = None
 
 
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_MAX_TERMINAL_AGE_DAYS = 7
+_MAX_REGISTRY_SIZE = 200
+_CLOUD_LOG_TIMEOUT = 30.0
+
+
 class JobRegistry:
-    """Single-file JSON registry of job records."""
+    """Single-file JSON registry of job records.
+
+    Evicts terminal jobs (completed/failed/cancelled) older than
+    ``_MAX_TERMINAL_AGE_DAYS`` on load. Caps total records at
+    ``_MAX_REGISTRY_SIZE``, dropping oldest terminal jobs first.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -105,6 +116,56 @@ class JobRegistry:
                 self._jobs[r.job_id] = r
         except Exception:
             logger.warning("Could not load %s, starting fresh", self._path)
+        pruned = self._prune()
+        if pruned:
+            logger.info("Pruned %d stale job records from registry", pruned)
+            self._save()
+
+    def _prune(self) -> int:
+        """Remove old terminal jobs and mark stale "running" jobs as failed."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=_MAX_TERMINAL_AGE_DAYS)
+        removed = 0
+        for rec in self._jobs.values():
+            if rec.status not in _TERMINAL_STATUSES:
+                try:
+                    ts = datetime.fromisoformat(rec.submit_time)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts < cutoff:
+                        rec.status = "failed"
+                except (ValueError, TypeError):
+                    rec.status = "failed"
+
+        to_remove: list[str] = []
+        for jid, rec in self._jobs.items():
+            if rec.status not in _TERMINAL_STATUSES:
+                continue
+            try:
+                ts = datetime.fromisoformat(rec.submit_time)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts < cutoff:
+                    to_remove.append(jid)
+            except (ValueError, TypeError):
+                to_remove.append(jid)
+        for jid in to_remove:
+            del self._jobs[jid]
+        removed += len(to_remove)
+
+        if len(self._jobs) > _MAX_REGISTRY_SIZE:
+            terminal = [
+                (jid, r)
+                for jid, r in self._jobs.items()
+                if r.status in _TERMINAL_STATUSES
+            ]
+            terminal.sort(key=lambda x: x[1].submit_time)
+            while len(self._jobs) > _MAX_REGISTRY_SIZE and terminal:
+                jid, _ = terminal.pop(0)
+                del self._jobs[jid]
+                removed += 1
+
+        return removed
 
     def _save(self) -> None:
         records = [dataclasses.asdict(r) for r in self._jobs.values()]
@@ -340,6 +401,8 @@ def _build_cloud_job_config(
     disk_size: int | None = None,
     use_spot: bool = False,
     num_nodes: int = 1,
+    setup_script: str = "",
+    run_script: str = "",
 ) -> launcher.JobConfig:
     """Build an ``oumi.launcher.JobConfig`` for **cloud** execution.
 
@@ -351,18 +414,22 @@ def _build_cloud_job_config(
     nodes are requested.  Default file mounts include common credential files
     (``~/.cache/huggingface/token``, ``~/.netrc``) when they exist locally;
     *file_mounts* entries take precedence and can override them.
+
+    When *setup_script* or *run_script* are provided, they override the
+    defaults (``_DEFAULT_CLOUD_SETUP_SCRIPT`` and the auto-generated run
+    command respectively).
     """
-    run_script = _build_shell_command(
+    effective_run = run_script or _build_shell_command(
         config_path, command, num_nodes=num_nodes, accelerators=accelerators
     )
+    effective_setup = setup_script or _DEFAULT_CLOUD_SETUP_SCRIPT
 
     resources = launcher.JobResources(cloud=cloud)
     if accelerators:
         resources.accelerators = accelerators
     if disk_size is not None:
         resources.disk_size = disk_size
-    if use_spot:
-        resources.use_spot = True
+    resources.use_spot = use_spot
     effective_mounts = _default_file_mounts()
     if file_mounts:
         effective_mounts.update(file_mounts)
@@ -372,19 +439,153 @@ def _build_cloud_job_config(
         num_nodes=num_nodes,
         resources=resources,
         working_dir=working_dir,
-        setup=_DEFAULT_CLOUD_SETUP_SCRIPT,
-        run=run_script,
+        setup=effective_setup,
+        run=effective_run,
         envs=envs or {},
         file_mounts=effective_mounts,
     )
 
 
-def start_local_job(record: JobRecord, rt: JobRuntime) -> None:
+def _generate_job_config_template(
+    config_path: str,
+    command: str,
+    cloud: str,
+    model_name: str,
+    *,
+    client_cwd: str = "",
+    job_name: str = "",
+    accelerators: str = "",
+    num_nodes: int = 1,
+    envs: dict[str, str] | None = None,
+    setup_script: str = "",
+    run_script: str = "",
+) -> str:
+    """Generate a complete, annotated job config YAML template.
+
+    Produces a ready-to-customize YAML string with TODO markers on sections
+    that need user attention. Pre-fills the training command, model info,
+    resources, and auto-detected credential mounts.
+    """
+    from datetime import datetime, timezone
+
+    date_tag = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+    safe_model = model_name.split("/")[-1].lower().replace("-", "").replace("_", "")
+    name = job_name or f"{command}-{safe_model}-{date_tag}"
+
+    if run_script:
+        run_block = run_script
+    else:
+        num_gpus = _parse_gpu_count(accelerators or None)
+        if num_gpus > 1 or num_nodes > 1:
+            run_block = (
+                f"set -e\noumi distributed torchrun -m oumi {command} -c ./config.yaml"
+            )
+        else:
+            oumi_cmd = _COMMAND_MAP.get(command, f"oumi {command}")
+            run_block = f"set -e\n{oumi_cmd} -c ./config.yaml"
+
+    if setup_script:
+        setup_block = setup_script
+    else:
+        setup_block = (
+            "set -e\n"
+            "pip install uv && uv pip install --system 'oumi[gpu]'\n"
+            "# TODO: Add dataset downloads, extra packages, preprocessing\n"
+            "# Example: huggingface-cli download <dataset-id> --repo-type dataset --local-dir ./data\n"
+            "# Example: uv pip install --system 'oumi[gpu,evaluation]'"
+        )
+
+    file_mount_lines = []
+    for cred_path in _DEFAULT_CREDENTIAL_FILES:
+        local_path = Path(cred_path).expanduser()
+        if local_path.exists():
+            file_mount_lines.append(f"  {cred_path}: {cred_path}")
+
+    env_lines = []
+    if envs:
+        for k, v in envs.items():
+            env_lines.append(f"  {k}: {json.dumps(v)}")
+
+    lines = [
+        "# Oumi Cloud Job Config — customize TODO sections before launching",
+        f"# Model: {model_name}",
+        "# Docs: https://oumi.ai/docs/en/latest/user_guides/launch/launch.html",
+        f"name: {name}",
+        "",
+        "resources:",
+        f"  cloud: {cloud}",
+    ]
+    if accelerators:
+        lines.append(f'  accelerators: "{accelerators}"')
+    else:
+        lines.append('  accelerators: "A100:8"  # TODO: Set GPU type and count')
+    lines += [
+        "  use_spot: false",
+        "  disk_size: 500",
+        "",
+        f"num_nodes: {num_nodes}",
+        "working_dir: .  # Resolved to client_cwd at launch time. Synced to ~/sky_workdir on the VM.",
+        "",
+    ]
+
+    if file_mount_lines:
+        lines.append("# Auto-detected credential files (add local dataset mounts below if needed)")
+        lines.append("file_mounts:")
+        lines.extend(file_mount_lines)
+        lines.append("  # TODO: Mount local dataset files if not git-tracked in working_dir")
+        lines.append("  # ~/sky_workdir/data/train.jsonl: /absolute/path/to/local/train.jsonl")
+    else:
+        lines.append("# TODO: Mount credential and data files needed on the remote VM")
+        lines.append("# file_mounts:")
+        lines.append("#   ~/.cache/huggingface/token: ~/.cache/huggingface/token")
+        lines.append("#   ~/sky_workdir/data/train.jsonl: /absolute/path/to/local/train.jsonl")
+    lines.append("")
+
+    lines += [
+        "# TODO: Mount cloud storage for persistent output (recommended for spot instances)",
+        "# storage_mounts:",
+        "#   /output:",
+        "#     source: gs://your-bucket/output",
+        "#     store: gcs",
+        "",
+    ]
+
+    lines.append("envs:")
+    if env_lines:
+        lines.extend(env_lines)
+    else:
+        lines.append(f'  OUMI_RUN_NAME: "{name}"')
+        lines.append("  # TODO: Add env vars (WANDB_API_KEY, HF_TOKEN, etc.)")
+    lines.append("  # Recommended for CUDA memory stability:")
+    lines.append('  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"')
+    lines.append("")
+
+    lines.append("# Setup script — runs once when the VM is provisioned")
+    lines.append("setup: |")
+    for setup_line in setup_block.split("\n"):
+        lines.append(f"  {setup_line}")
+    lines.append("")
+
+    lines.append("# Run command (auto-generated from your training config)")
+    lines.append("run: |")
+    for run_line in run_block.split("\n"):
+        lines.append(f"  {run_line}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def start_local_job(
+    record: JobRecord, rt: JobRuntime, client_cwd: str = ""
+) -> None:
     """Start a local job by spawning the Oumi CLI directly.
 
     Creates the log directory, starts the subprocess via ``Popen``, and
     sets ``rt.process`` and ``record.oumi_job_id``. Raises on failure
     (e.g. command not found, permission denied).
+
+    When *client_cwd* is provided, the subprocess runs from that directory
+    so relative paths in the config resolve against the user's project root.
 
     Stdout and stderr are written to files in ``rt.log_dir`` so
     that ``tail_log_file()`` can stream them to the MCP client.
@@ -403,13 +604,16 @@ def start_local_job(record: JobRecord, rt: JobRuntime) -> None:
     stdout_f = open(stdout_path, "w")
     stderr_f = open(stderr_path, "w")
 
+    popen_kwargs: dict[str, Any] = {
+        "env": env,
+        "stdout": stdout_f,
+        "stderr": stderr_f,
+    }
+    if client_cwd:
+        popen_kwargs["cwd"] = client_cwd
+
     try:
-        proc = subprocess.Popen(
-            cmd_argv,
-            env=env,
-            stdout=stdout_f,
-            stderr=stderr_f,
-        )
+        proc = subprocess.Popen(cmd_argv, **popen_kwargs)
     except Exception:
         stdout_f.close()
         stderr_f.close()
@@ -417,7 +621,9 @@ def start_local_job(record: JobRecord, rt: JobRuntime) -> None:
 
     rt.process = proc
     record.oumi_job_id = str(proc.pid)
-    get_registry().update(record.job_id, oumi_job_id=record.oumi_job_id, status="running")
+    get_registry().update(
+        record.job_id, oumi_job_id=record.oumi_job_id, status="running"
+    )
     rt.stdout_f = stdout_f
     rt.stderr_f = stderr_f
     logger.info(
@@ -471,6 +677,7 @@ async def _launch_cloud(
     record: JobRecord,
     rt: JobRuntime,
     *,
+    client_cwd: str = "",
     accelerators: str | None = None,
     envs: dict[str, str] | None = None,
     file_mounts: dict[str, str] | None = None,
@@ -478,6 +685,7 @@ async def _launch_cloud(
     use_spot: bool = False,
     num_nodes: int = 1,
     setup_script: str | None = None,
+    run_script: str | None = None,
 ) -> None:
     """Launch a cloud job via ``oumi.launcher.up()``.
 
@@ -510,6 +718,16 @@ async def _launch_cloud(
             job_config = launcher.JobConfig.from_yaml(rt.staged_config_path)
             if not job_config.name:
                 job_config.name = record.job_id
+            # Resolve relative working_dir against client_cwd so SkyPilot
+            # syncs the user's project, not the MCP staging directory.
+            if client_cwd and job_config.working_dir:
+                wd = Path(job_config.working_dir).expanduser()
+                if not wd.is_absolute():
+                    job_config.working_dir = str(
+                        (Path(client_cwd) / wd).resolve()
+                    )
+            elif client_cwd and not job_config.working_dir:
+                job_config.working_dir = client_cwd
             if envs:
                 merged = dict(job_config.envs or {})
                 merged.update(envs)
@@ -524,7 +742,7 @@ async def _launch_cloud(
                 staged_config_name,
                 record.command,
                 cloud=record.cloud,
-                working_dir=str(rt.run_dir),
+                working_dir=client_cwd or str(rt.run_dir),
                 accelerators=accelerators,
                 job_name=record.job_id,
                 envs=envs,
@@ -532,6 +750,8 @@ async def _launch_cloud(
                 disk_size=disk_size,
                 use_spot=use_spot,
                 num_nodes=num_nodes,
+                setup_script=setup_script or "",
+                run_script=run_script or "",
             )
         cluster, status = await asyncio.to_thread(
             launcher.up,
@@ -548,7 +768,6 @@ async def _launch_cloud(
             cluster_name=cluster_name,
             status="running",
         )
-        # Refresh the local record reference
         record = reg.get(record.job_id) or record
         logger.info(
             "Cloud job %s launched on %s (oumi_id=%s)",
@@ -581,6 +800,7 @@ async def launch_job(
     record: JobRecord,
     rt: JobRuntime,
     *,
+    client_cwd: str = "",
     accelerators: str | None = None,
     envs: dict[str, str] | None = None,
     file_mounts: dict[str, str] | None = None,
@@ -588,6 +808,7 @@ async def launch_job(
     use_spot: bool = False,
     num_nodes: int = 1,
     setup_script: str | None = None,
+    run_script: str | None = None,
 ) -> None:
     """Launch a job -- local or cloud -- in a background thread.
 
@@ -595,12 +816,13 @@ async def launch_job(
     For cloud jobs, delegates to ``oumi.launcher.up()``.
     """
     if record.cloud == "local":
-        start_local_job(record, rt)
+        start_local_job(record, rt, client_cwd=client_cwd)
         await wait_local_completion(record, rt)
     else:
         await _launch_cloud(
             record,
             rt,
+            client_cwd=client_cwd,
             accelerators=accelerators,
             envs=envs,
             file_mounts=file_mounts,
@@ -608,6 +830,7 @@ async def launch_job(
             use_spot=use_spot,
             num_nodes=num_nodes,
             setup_script=setup_script,
+            run_script=run_script,
         )
 
 
@@ -641,9 +864,7 @@ async def poll_status(record: JobRecord, rt: JobRuntime) -> OumiJobStatus | None
 
     if rt.cluster_obj and record.oumi_job_id:
         try:
-            status = await asyncio.to_thread(
-                rt.cluster_obj.get_job, record.oumi_job_id
-            )
+            status = await asyncio.to_thread(rt.cluster_obj.get_job, record.oumi_job_id)
             if status:
                 rt.oumi_status = status
                 reg.update(
@@ -855,6 +1076,110 @@ async def tail_log_file(
             return
 
         await asyncio.sleep(poll_interval)
+
+
+async def _get_cloud_logs(
+    record: JobRecord,
+    rt: JobRuntime,
+    lines: int = 200,
+) -> tuple[str, int] | None:
+    """Fetch the last *lines* of logs from a cloud job.
+
+    Uses ``cluster.get_logs_stream()`` which calls ``sky.tail_logs(follow=True)``.
+    Since ``follow=True`` means the stream never ends for running jobs, we read
+    with a timeout and return whatever was accumulated (partial logs are better
+    than nothing).
+    """
+    cluster = rt.cluster_obj
+
+    if cluster is None and record.cloud and record.cluster_name:
+        try:
+            cloud_obj = await asyncio.to_thread(launcher.get_cloud, record.cloud)
+            cluster = await asyncio.to_thread(
+                cloud_obj.get_cluster, record.cluster_name
+            )
+        except Exception:
+            logger.debug(
+                "Failed to reconstruct cluster for %s/%s",
+                record.cloud,
+                record.cluster_name,
+                exc_info=True,
+            )
+            return None
+
+    if cluster is None:
+        logger.debug(
+            "Cluster %s/%s not found (may have been deleted)",
+            record.cloud,
+            record.cluster_name,
+        )
+        return None
+
+    try:
+        stream: io.TextIOBase = await asyncio.to_thread(
+            cluster.get_logs_stream,
+            record.cluster_name,
+            record.oumi_job_id or None,
+        )
+    except NotImplementedError:
+        logger.debug(
+            "Cloud %s does not support get_logs_stream for job %s",
+            record.cloud,
+            record.job_id,
+        )
+        return None
+    except Exception:
+        logger.debug(
+            "get_logs_stream failed for job %s",
+            record.job_id,
+            exc_info=True,
+        )
+        return None
+
+    chunks: list[str] = []
+
+    def _read_stream() -> str:
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                chunks.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        return "".join(chunks)
+
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(_read_stream),
+            timeout=_CLOUD_LOG_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        raw = "".join(chunks)
+        if raw:
+            logger.debug(
+                "Cloud log read timed out for job %s after %.0fs, "
+                "returning %d partial lines",
+                record.job_id,
+                _CLOUD_LOG_TIMEOUT,
+                raw.count("\n"),
+            )
+
+    if not raw:
+        return None
+
+    all_lines = raw.splitlines()
+    tail = all_lines[-lines:] if lines > 0 else all_lines
+    return ("\n".join(tail), len(tail))
 
 
 async def stream_cloud_logs(

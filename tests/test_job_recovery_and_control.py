@@ -2,6 +2,7 @@ import asyncio
 import logging
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -19,6 +20,9 @@ from oumi_mcp_server.job_service import (
 
 class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
     def test_registry_persists_and_rehydrates(self) -> None:
+        from datetime import datetime, timezone
+
+        recent = datetime.now(timezone.utc).isoformat()
         with tempfile.TemporaryDirectory() as tmp_dir:
             state_file = Path(tmp_dir) / "jobs.json"
             reg1 = JobRegistry(path=state_file)
@@ -31,7 +35,7 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 oumi_job_id="sky-job-123",
                 model_name="meta-llama/Llama-3.1-8B-Instruct",
                 status="running",
-                submit_time="2026-02-12T17:09:25+00:00",
+                submit_time=recent,
             )
             reg1.add(record)
 
@@ -43,6 +47,39 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded.cloud, "gcp")
         self.assertEqual(loaded.cluster_name, "cluster-a")
         self.assertEqual(loaded.oumi_job_id, "sky-job-123")
+
+    def test_registry_prunes_old_terminal_jobs(self) -> None:
+        """Terminal jobs older than 7 days are evicted on load."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_file = Path(tmp_dir) / "jobs.json"
+            reg = JobRegistry(path=state_file)
+            reg.add(JobRecord(
+                job_id="old_job",
+                command="train",
+                config_path="/tmp/t.yaml",
+                cloud="gcp",
+                cluster_name="c",
+                oumi_job_id="1",
+                model_name="m",
+                status="failed",
+                submit_time="2020-01-01T00:00:00+00:00",
+            ))
+            reg.add(JobRecord(
+                job_id="recent_job",
+                command="train",
+                config_path="/tmp/t.yaml",
+                cloud="gcp",
+                cluster_name="c",
+                oumi_job_id="2",
+                model_name="m",
+                status="completed",
+                submit_time=datetime.now(timezone.utc).isoformat(),
+            ))
+
+            # Reload — should prune old_job but keep recent_job
+            reg2 = JobRegistry(path=state_file)
+            self.assertIsNone(reg2.get("old_job"))
+            self.assertIsNotNone(reg2.get("recent_job"))
 
     async def test_cancel_job_supports_direct_cloud_identity(self) -> None:
         with (
@@ -100,10 +137,20 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response["success"])
         self.assertEqual(response["status"], "not_found")
 
-    async def test_get_job_logs_by_direct_identity_returns_helpful_message(
+    async def test_get_job_logs_by_direct_identity_tries_cloud_retrieval(
         self,
     ) -> None:
-        with patch("oumi_mcp_server.server._resolve_job_record", return_value=None):
+        """When job is not in registry, get_job_logs should attempt direct cloud
+        log retrieval via an ephemeral JobRecord instead of giving up."""
+        mock_logs = ("line1\nline2\nline3", 3)
+        with (
+            patch("oumi_mcp_server.server._resolve_job_record", return_value=None),
+            patch(
+                "oumi_mcp_server.server._get_cloud_logs",
+                new_callable=AsyncMock,
+                return_value=mock_logs,
+            ),
+        ):
             response = await server.get_job_logs(
                 job_id="",
                 oumi_job_id="sky-job-123",
@@ -112,8 +159,25 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
                 lines=50,
             )
 
+        self.assertTrue(response["success"])
+        self.assertEqual(response["lines_returned"], 3)
+        self.assertIn("line1", response["logs"])
+
+    async def test_get_job_logs_by_direct_identity_without_cluster_name(
+        self,
+    ) -> None:
+        """Direct cloud log retrieval requires cluster_name."""
+        with patch("oumi_mcp_server.server._resolve_job_record", return_value=None):
+            response = await server.get_job_logs(
+                job_id="",
+                oumi_job_id="sky-job-123",
+                cloud="gcp",
+                cluster_name="",
+                lines=50,
+            )
+
         self.assertFalse(response["success"])
-        self.assertIn("sky logs cluster-a", response["error"])
+        self.assertIn("cluster_name is required", response["error"])
 
     def test_logging_configuration_downgrades_noisy_mcp_loggers(self) -> None:
         server._configure_logging()
@@ -131,6 +195,7 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             response = await server.run_oumi_job(
                 config_path=str(bad_cfg),
                 command="train",
+                client_cwd=tmp_dir,
                 dry_run=False,
                 confirm=True,
                 user_confirmation="EXECUTE",
@@ -148,6 +213,7 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
             with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
                 response = await server.run_oumi_job(
                     config_path=str(cfg),
+                    client_cwd=tmp_dir,
                     command="train",
                     cloud="gcp",
                     dry_run=True,
@@ -312,12 +378,13 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(r["success"])
 
     async def test_dry_run_cloud_shows_jobconfig_yaml_preview(self) -> None:
-        """Cloud dry-run for training config should show full JobConfig YAML."""
+        """Cloud dry-run for training config should show job config template."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg = Path(tmp_dir) / "train.yaml"
             cfg.write_text("model: {model_name: test/model}\n", encoding="utf-8")
             response = await server.run_oumi_job(
                 config_path=str(cfg),
+                client_cwd=tmp_dir,
                 command="train",
                 cloud="gcp",
                 accelerators="A100:4",
@@ -330,7 +397,9 @@ class JobRecoveryAndControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("A100:4", msg)
         self.assertIn("setup:", msg)
         self.assertIn("run:", msg)
-        self.assertIn("--- Generated JobConfig", msg)
+        self.assertIn("--- Job Config Template", msg)
+        self.assertIn("NEXT STEPS:", msg)
+        self.assertIn("guidance://cloud-launch", msg)
 
 
     async def test_stop_cluster_calls_launcher_stop(self) -> None:

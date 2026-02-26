@@ -142,10 +142,19 @@ class PreFlightCheckResponse(TypedDict):
         cloud_readiness: SkyPilot cloud credential status.
         errors: Issues that will cause the training run to crash.
         warnings: Potential issues that may be fine if targeting a remote cluster.
-        paths: Local filesystem paths from the config mapped to whether they exist.
+        paths: Config paths mapped to validation status: "ok", "not_found",
+            "ok_remote", "not_found_warning", or "local_machine_path_error".
+        dataset_checks: Per-dataset validation results (e.g. "ok", "not_found",
+            "warning_timeout"). Only present when datasets are found in config.
+        env_warnings: Warnings about environment variable overrides that may
+            silently change behavior (e.g. OUMI_USE_SPOT_VM).
         suggested_configs: Relative config paths relevant to the model in this config.
             Only present when ``cloud`` was specified. Pass these to ``get_config()``
             to retrieve full YAML examples for reference or adaptation.
+        cloud_file_checks: Per-path cloud file delivery validation. Keys are
+            paths from the config, values are statuses: "ok", "missing_local_source",
+            "not_reachable_on_vm", "unverifiable_remote", "working_dir_suspicious".
+            Only present for cloud jobs.
     """
 
     blocking: bool
@@ -156,8 +165,11 @@ class PreFlightCheckResponse(TypedDict):
     cloud_readiness: CloudReadiness
     errors: list[str]
     warnings: list[str]
-    paths: dict[str, bool]
+    paths: dict[str, str]
+    dataset_checks: NotRequired[dict[str, str]]
+    env_warnings: NotRequired[list[str]]
     suggested_configs: NotRequired[list[str]]
+    cloud_file_checks: NotRequired[dict[str, str]]
 
 
 class JobSubmissionResponse(TypedDict):

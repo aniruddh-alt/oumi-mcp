@@ -1,60 +1,19 @@
 """Oumi MCP Server - ML Training Config Discovery and Execution.
 
-This server helps you set up ML training workflows using Oumi's library of ~500
-ready-to-use YAML configs for fine-tuning LLMs (Llama, Qwen, Phi, Gemma, etc.).
+~500 ready-to-use YAML configs for fine-tuning LLMs (Llama, Qwen, Phi, etc.).
+Local execution via subprocess, cloud execution via oumi.launcher.
 
-Jobs are executed locally via ``subprocess.Popen`` (running the Oumi CLI).
+IMPORTANT — ALWAYS call get_started() FIRST before using any other tool.
+get_started() returns the full tool catalog, resource list, and recommended
+workflow. Without it you will miss critical path-resolution rules and the
+correct order of operations.
 
-⚠️  CRITICAL: WORKING DIRECTORY AND PATHS
-    Jobs run from a different working directory than your project root.
-    - **Config file paths** MUST be absolute (e.g., /home/user/config.yaml)
-    - **Paths inside configs** (dataset_path, output_dir, etc.) should also be
-      absolute, or relative paths will fail with "file not found" errors.
-    - Use absolute paths or expand ~ (which gets converted to absolute).
-    - Relative paths like "data/train.jsonl" will fail unless the job's cwd
-      is set to your project root, which it is not.
-
-GETTING STARTED:
-    Call get_started() to see all capabilities and recommended workflow.
-
-TOOLS -- Discovery:
-    - get_started: Overview of capabilities and quickstart guide
-    - list_categories: Discover available models and config types
-    - search_configs: Find training configs by query, task, or model
-    - get_config: Get config details and full YAML content
-    - validate_config: Validate configs before running
-    - pre_flight_check: Catch issues before launch (HF auth, hardware, paths, cloud credentials)
-    - get_docs: Search Oumi Python API docs (classes, fields, functions)
-      for tool discovery and parameter lookup. Supports exact qualified-name
-      match, exact short-name match, and relevance-ranked keyword search.
-    - list_modules: List indexed API modules with class/function counts.
-      Use this first to discover available namespaces before calling get_docs.
-
-TOOLS -- Execution:
-    - run_oumi_job: Execute any Oumi command (local or cloud)
-      with dry-run safety and background execution
-    - get_job_status: Snapshot status for a running/completed job
-    - get_job_logs: Snapshot tail logs for a running/completed job
-    - cancel_job: Cancel a running job
-    - list_jobs: List running and completed jobs
-
-RESOURCES:
-    - guidance://mle-workflow, guidance://mle-train, etc.
-    - jobs://running, jobs://completed -- live job listings
-    - jobs://{job_id}/logs -- full log output for any job
-
-EXAMPLE WORKFLOW:
-    1. get_started()                                                  # See capabilities
-    2. list_categories()                                              # See available models
-    3. search_configs(model="llama3_1", task="sft")                  # Find recipes
-    4. get_config("llama3_1/sft/8b_lora", include_content=True)      # Get YAML
-    5. validate_config("/path/to/config.yaml", "training")           # Validate
-    6. pre_flight_check("/path/to/config.yaml", cloud="gcp")          # Pre-flight
-    7. run_oumi_job("/path/to/config.yaml", "train")                 # Preview (dry-run)
-    8. run_oumi_job("/path/to/config.yaml", "train", confirm=True, user_confirmation="EXECUTE")  # Execute
-    9. get_job_status("train_20260206_...")                           # Status snapshot
-   10. get_job_logs("train_20260206_...", lines=200)                  # Log snapshot
-   11. list_jobs(status="running")                                    # See running jobs
+Path rules:
+- All path-sensitive tools require client_cwd (the user's project root).
+- Config file path: absolute OR relative to client_cwd.
+- Local jobs: subprocess runs from client_cwd; paths inside YAML resolve there.
+- Cloud jobs: client_cwd becomes working_dir on remote VM;
+  use repo-relative paths inside YAML. NEVER use local machine paths.
 """
 
 import asyncio
@@ -143,9 +102,10 @@ from oumi_mcp_server.docs_service import (
 from oumi_mcp_server.job_service import (
     JobRecord,
     JobRuntime,
-    _build_cloud_job_config,
-    _default_file_mounts,
+    _generate_job_config_template,
+    _get_cloud_logs,
     _is_job_config,
+    _parse_gpu_count,
     cancel,
     get_log_paths,
     get_registry,
@@ -175,9 +135,11 @@ from oumi_mcp_server.models import (
 )
 from oumi_mcp_server.prompts.mle_prompt import (
     ANALYZE_COMMAND_RESOURCE,
+    CLOUD_LAUNCH_RESOURCE,
     EVAL_COMMAND_RESOURCE,
     INFER_COMMAND_RESOURCE,
     MLE_WORKFLOW_RESOURCE,
+    POST_TRAINING_RESOURCE,
     SYNTH_COMMAND_RESOURCE,
     TRAIN_COMMAND_RESOURCE,
 )
@@ -304,7 +266,13 @@ def get_gpu_info() -> dict[str, Any]:
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("Oumi Config Server")
+mcp = FastMCP(
+    "Oumi Config Server",
+    instructions=(
+        "IMPORTANT: Always call get_started() FIRST before using any other tool. "
+        "It returns the full tool catalog, path rules, and recommended workflow."
+    ),
+)
 
 
 def _configure_logging() -> None:
@@ -318,24 +286,49 @@ def _configure_logging() -> None:
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
-def _resolve_config_path(config: str) -> tuple[Path, str | None]:
-    """Resolve and validate a config file path.
+_OUMI_ENV_OVERRIDES = ("OUMI_USE_SPOT_VM", "OUMI_FORCE_EDITABLE_INSTALL")
 
-    Requires an absolute path (after ``~`` expansion). Returns a clear error
-    when a relative path is given so callers surface an actionable message
-    instead of silently resolving against the MCP server's working directory.
 
-    Returns:
-        ``(resolved_path, None)`` on success, or ``(Path(), error_message)``
-        on failure.
+def _strip_oumi_env_overrides() -> None:
+    """Remove oumi env vars that silently override launcher config values.
+
+    These are CLI convenience toggles (e.g. "always use spot") that make
+    sense for interactive ``oumi launch up`` but break programmatic callers
+    like this MCP server — the tool's explicit parameters should be the
+    sole source of truth.
     """
-    p = Path(config).expanduser()
-    if not p.is_absolute():
+    for var in _OUMI_ENV_OVERRIDES:
+        val = os.environ.pop(var, None)
+        if val:
+            logger.info("Stripped inherited env var %s=%r from MCP process", var, val)
+
+
+def _resolve_path(raw: str, client_cwd: Path) -> Path:
+    """Resolve a path string against the client's working directory.
+
+    Absolute paths (after ``~`` expansion) are returned as-is.
+    Relative paths are resolved against *client_cwd*.
+    """
+    expanded = Path(raw).expanduser()
+    if expanded.is_absolute():
+        return expanded.resolve()
+    return (client_cwd / expanded).resolve()
+
+
+def _resolve_config_path(config: str, client_cwd: str) -> tuple[Path, str | None]:
+    """Resolve and validate a config file path against the client's CWD.
+
+    Requires *client_cwd* to be absolute. Relative *config* paths are
+    resolved against it. Returns ``(resolved_path, None)`` on success,
+    or ``(Path(), error_message)`` on failure.
+    """
+    cwd = Path(client_cwd).expanduser()
+    if not cwd.is_absolute():
         return Path(), (
-            f"Path must be absolute, got relative path: '{config}'. "
-            f"Provide the full path (e.g. '/home/user/configs/{Path(config).name}')."
+            f"client_cwd must be absolute, got: '{client_cwd}'. "
+            "Provide the full path to your project directory."
         )
-    p = p.resolve()
+    p = _resolve_path(config, cwd)
     if not p.exists():
         return Path(), f"Config file not found: {p}"
     if not p.is_file():
@@ -413,6 +406,30 @@ async def get_infer_command_guidance() -> str:
     return INFER_COMMAND_RESOURCE
 
 
+@mcp.resource("guidance://cloud-launch")
+async def get_cloud_launch_guidance() -> str:
+    """Cloud job launch guidance — job config anatomy, setup patterns, examples.
+
+    Read this resource when planning a cloud training run. Explains what a job
+    config is, the key fields to customize, common setup patterns (dataset
+    downloads, extra packages), and how ``run_oumi_job`` works with both
+    training configs and job configs.
+    """
+    return CLOUD_LAUNCH_RESOURCE
+
+
+@mcp.resource("guidance://post-training")
+async def get_post_training_guidance() -> str:
+    """Post-training guidance — downloading weights, evaluation, teardown, merging.
+
+    Read this resource after a cloud training job succeeds. Covers the full
+    post-training lifecycle: downloading model weights via SkyPilot CLI,
+    running evaluation on the live cluster, tearing down to stop billing,
+    merging LoRA adapters locally, and pushing to HuggingFace Hub.
+    """
+    return POST_TRAINING_RESOURCE
+
+
 @mcp.tool()
 def search_configs(
     query: str = "",
@@ -421,46 +438,17 @@ def search_configs(
     keyword: str | list[str] = "",
     limit: int = DEFAULT_SEARCH_LIMIT,
 ) -> list[ConfigMetadata]:
-    """Search the Oumi config library for ML training, evaluation, and inference configs.
+    """Search the Oumi config library (~500 configs for LLM fine-tuning).
 
-    Use this as your first step when looking for example configs. The library contains
-    ~500 ready-to-use YAML configs for fine-tuning LLMs (Llama, Qwen, Phi, Gemma, etc.)
-    with various techniques (SFT, DPO, GRPO, LoRA, QLoRA).
-
-    All filters are case-insensitive substring matches on the file path. Combine
-    multiple filters to narrow results.
+    All filters are case-insensitive substring matches. Combine to narrow.
 
     Args:
-        query: General search term matching any part of the path.
-               Use for size ("8b", "70b"), variant ("instruct"), or technique ("lora", "qlora").
-               Space-separated words are all required (AND logic).
-        task: Filter by training/task type.
-              Options: sft (supervised fine-tuning), dpo (direct preference optimization),
-                       kto, grpo (group relative policy optimization), eval, infer, pretrain
-        model: Filter by model family.
-               Options: llama3_1, llama3_2, llama4, qwen3, phi4, gemma3, deepseek_r1, etc.
-        keyword: Case-insensitive substring match on config file content.
-                 Pass a list to require all keywords to be present (AND logic).
-                 E.g. "packing" or ["packing", "flash_attention"].
-        limit: Maximum results to return (default 20).
-
-    Returns:
-        List of matching configs, each with:
-        - path: Relative path to use with get_config()
-        - description: What this config does
-        - model_name: HuggingFace model ID (e.g., "meta-llama/Llama-3.1-8B-Instruct")
-        - task_type: Training type (sft/dpo/grpo/evaluation/inference)
-        - datasets: Dataset names used for training
-        - peft_type: "lora", "qlora", or null for full fine-tuning
-
-    Examples:
-        - search_configs(model="llama3_1", task="sft") -> All Llama 3.1 SFT configs
-        - search_configs(query="8b", task="sft") -> All 8B model SFT configs
-        - search_configs(query="lora", model="qwen3") -> Qwen3 LoRA configs
-        - search_configs(task="grpo") -> All GRPO/RLHF training configs
-        - search_configs(query="qlora") -> All QLoRA (quantized LoRA) configs
-        - search_configs(keyword="packing") -> Configs mentioning packing in YAML
-        - search_configs(keyword=["packing", "flash_attention"]) -> Configs with both
+        query: Path substring — size ("8b"), variant ("instruct"), or
+            technique ("lora"). Space-separated words use AND logic.
+        task: Task type: sft, dpo, kto, grpo, eval, infer, pretrain.
+        model: Model family: llama3_1, qwen3, phi4, gemma3, deepseek_r1, etc.
+        keyword: Content substring match. List = AND logic.
+        limit: Max results (default 20).
     """
     configs = get_all_configs()
     return search_configs_service(configs, query, task, model, keyword, limit)
@@ -468,36 +456,17 @@ def search_configs(
 
 @mcp.tool()
 def get_config(path: str, include_content: bool = False) -> ConfigDetail:
-    """Get detailed information about a specific Oumi config file.
+    """Get details about a specific Oumi config file.
 
-    Use this after search_configs() to get full details about a config, including
-    hyperparameters and optionally the complete YAML content. This helps you
-    understand the config before using it as a template or running training.
+    Use the returned config as a REFERENCE to understand structure, field names,
+    and reasonable defaults — do NOT copy it verbatim. Build the user's config
+    from scratch, adapting only the relevant settings (model, dataset, training
+    params, PEFT) to match their specific requirements, hardware, and data.
 
     Args:
-        path: Config path from search_configs() results, or a partial path.
-              Full path example: "recipes/llama3_1/sft/8b_lora/train.yaml"
-              Partial paths work too: "llama3_1/sft/8b_lora" will match.
-        include_content: Set True to get the full YAML content for copying/modifying.
-                        Default False returns only metadata.
-
-    Returns:
-        Dict with full config details:
-        - path: Relative path to the config file
-        - description: What this config does (from file header)
-        - model_name: HuggingFace model ID (e.g., "meta-llama/Llama-3.1-8B-Instruct")
-        - task_type: Training type (sft/dpo/grpo/evaluation/inference)
-        - datasets: List of dataset names used
-        - reward_functions: Reward functions for RLHF (empty for non-RLHF)
-        - peft_type: "lora", "qlora", or null for full fine-tuning
-        - key_settings: Important hyperparameters (learning_rate, batch_size, epochs, etc.)
-        - content: Full YAML text (only if include_content=True)
-        - error: Error message if config not found
-
-    Examples:
-        - get_config("recipes/llama3_1/sft/8b_lora/train.yaml") -> Metadata only
-        - get_config("llama3_1/sft/8b_lora", include_content=True) -> With full YAML
-        - get_config("qwen3/grpo") -> First matching Qwen3 GRPO config
+        path: Config path from search_configs(), or a partial path
+            (e.g. "llama3_1/sft/8b_lora" will match).
+        include_content: Include full YAML content (default False).
     """
     configs = get_all_configs()
     match = find_config_match(path, configs)
@@ -571,28 +540,7 @@ def _build_version_warning() -> str:
 
 @mcp.tool()
 def list_categories() -> CategoriesResponse:
-    """List all available config categories, model families, and API providers.
-
-    Use this to discover what's available in the Oumi config library before searching.
-    Helpful for understanding the scope of supported models and training approaches.
-
-    Returns:
-        Dict with:
-        - categories: Top-level config directories
-          ["recipes", "apis", "examples", "projects"]
-        - model_families: All supported model families in recipes/
-          e.g., ["llama3_1", "llama3_2", "llama4", "qwen3", "phi4", "gemma3", ...]
-        - api_providers: Available API providers in apis/
-          e.g., ["anthropic", "openai", "together", ...]
-        - total_configs: Total number of configs in the library (~500)
-        - oumi_version: Installed oumi library version
-        - configs_source: Where configs are loaded from
-        - version_warning: Non-empty if configs may be mismatched with the library
-
-    Examples:
-        - list_categories() -> See all available models and categories
-        - Then use search_configs(model="llama3_1") to find specific configs
-    """
+    """List available config categories, model families, and API providers."""
     configs_dir = get_configs_dir()
     configs = get_all_configs()
     return get_categories(
@@ -619,67 +567,38 @@ TASK_MAPPING = {
 
 
 @mcp.tool()
-def pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
-    """Run pre-flight checks on a config to catch issues before launching.
+def pre_flight_check(
+    config: str, client_cwd: str, cloud: str = ""
+) -> PreFlightCheckResponse:
+    """Run pre-flight checks to catch issues before launching.
 
-    Validates four areas and returns errors (will crash) vs warnings (may be
-    fine if you are configuring locally but targeting a remote GPU cluster):
+    Validates: HF auth & gated repo access, hardware/packages, local paths,
+    and cloud credentials (with actual API calls, not just file checks).
 
-    1. HuggingFace auth — token validity and gated model/dataset access.
-    2. Hardware — missing packages (flash-attn, bitsandbytes, deepspeed),
-       torch version requirements, GPU presence, and compute capability.
-    3. Paths — whether local directories referenced in the config exist.
-    4. Cloud readiness — SkyPilot installation and cloud credential
-       validation. Performs actual API calls to verify credentials (not just
-       file existence). When ``cloud`` is specified, also validates that the
-       target cloud provider is ready.
-
-    IMPORTANT: When the response has `blocking=True`, there are hard blockers
-    that WILL prevent the run from succeeding. You MUST surface these to the
-    user as showstoppers and instruct them to resolve the issues before
-    proceeding. Do NOT treat blocking issues as informational notes.
+    When ``blocking=True`` in the response, there are hard blockers that
+    WILL prevent the run from succeeding — surface these as showstoppers.
 
     Args:
-        config: Absolute path to the YAML config file.
-        cloud: Optional cloud provider to target (e.g. "gcp", "aws", "azure",
-               "lambda"). When provided, validates that credentials for this
-               cloud are configured and working, and returns ``suggested_configs``
-               — a list of config paths from the Oumi library that match the
-               model in your config. Use these with ``get_config(path,
-               include_content=True)`` to retrieve reference YAML examples you
-               can adapt for your cloud job. Leave empty for local runs.
-
-    Returns:
-        PreFlightCheckResponse with:
-        - blocking: True if there are hard blockers — the run WILL fail.
-          When True, you MUST tell the user to fix these before proceeding.
-        - summary: One-line verdict to surface to the user.
-        - hf_authenticated: True if a valid HuggingFace token was found.
-        - repo_access: Per-repo status — "ok", "gated", "not_found", or "error".
-        - hardware: Detected accelerator, GPU info, and installed package versions.
-        - cloud_readiness: SkyPilot status — which clouds have valid credentials,
-          and whether the target cloud (if specified) is ready.
-        - errors: Issues that will cause the run to crash (missing packages, etc.).
-        - warnings: Issues that may be fine for remote clusters (no local GPU, etc.).
-        - paths: Local paths from the config mapped to whether they exist.
-        - suggested_configs: (cloud only) Relative paths of similar configs from
-          the library. Call ``get_config(path, include_content=True)`` on these
-          to get full YAML you can use as a reference or starting point.
-
-    Examples:
-        - pre_flight_check("/home/user/train.yaml")
-        - pre_flight_check("/home/user/train.yaml", cloud="gcp")
+        config: Absolute path, or relative to client_cwd, to the YAML config file.
+        client_cwd: REQUIRED. Absolute path to the client's working directory
+            (project root). Resolves relative config paths and sets the execution
+            context for local and cloud jobs.
+        cloud: Target cloud provider (e.g. "gcp", "aws"). Validates
+            credentials and returns ``suggested_configs`` for that cloud.
+            Leave empty for local runs.
     """
-    return _pre_flight_check(config, cloud=cloud)
+    return _pre_flight_check(config, client_cwd=client_cwd, cloud=cloud)
 
 
-def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
+def _pre_flight_check(
+    config: str, client_cwd: str, cloud: str = ""
+) -> PreFlightCheckResponse:
     """Run pre-flight checks (internal implementation)."""
     errors: list[str] = []
     warnings: list[str] = []
     repo_access: dict[str, str] = {}
 
-    config_path, path_error = _resolve_config_path(config)
+    config_path, path_error = _resolve_config_path(config, client_cwd)
     if path_error:
         errors.append(path_error)
         return {
@@ -767,6 +686,60 @@ def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
     errors.extend(cloud_errors)
     warnings.extend(cloud_warnings)
 
+    dataset_checks = validate_datasets(cfg)
+    for ds_key, ds_status in dataset_checks.items():
+        if ds_status == "not_found":
+            errors.append(
+                f"Dataset '{ds_key}' is not a registered Oumi dataset, not found on "
+                "HuggingFace Hub, and no local dataset_path provided. Use a full HF ID "
+                "(e.g., 'yahma/alpaca-cleaned'), a registered name (e.g., "
+                "'text_sft_jsonl'), or set dataset_path."
+            )
+        elif ds_status == "warning_timeout":
+            warnings.append(f"HF Hub probe for dataset '{ds_key}' timed out (5s)")
+
+    env_warnings = _check_env_overrides(target_cloud)
+    warnings.extend(env_warnings)
+
+    path_results = validate_paths(cfg, Path(client_cwd), cloud=target_cloud)
+    for path_key, path_status in path_results.items():
+        if path_status == "local_machine_path_error":
+            errors.append(
+                f"Local machine path '{path_key}' will not exist on the remote VM. "
+                "Use a repo-relative path (e.g., 'data/...') that resolves from "
+                "your working_dir."
+            )
+
+    if target_cloud:
+        skyignore_warnings = _check_skyignore(config_path.parent, path_results)
+        warnings.extend(skyignore_warnings)
+
+    cloud_file_checks: dict[str, str] = {}
+    if target_cloud:
+        cloud_file_checks = _check_cloud_files(cfg, config_path, target_cloud)
+        for path_key, check_status in cloud_file_checks.items():
+            if check_status == "missing_local_source":
+                errors.append(
+                    f"file_mounts source '{path_key}' does not exist locally. "
+                    "The file won't be copied to the remote VM."
+                )
+            elif check_status == "not_reachable_on_vm":
+                errors.append(
+                    f"Path '{path_key}' has no delivery mechanism to the remote VM. "
+                    "Use a job config with file_mounts, add it to working_dir, "
+                    "or download it in setup_script."
+                )
+            elif check_status == "working_dir_suspicious":
+                warnings.append(
+                    f"'{path_key}' does not exist locally. Use 'working_dir: .' "
+                    "(resolved to client_cwd at launch) or verify the path."
+                )
+            elif check_status == "unverifiable_remote":
+                warnings.append(
+                    f"Remote path '{path_key}' can't be validated locally. "
+                    "Ensure it exists on the VM via setup_script or storage_mounts."
+                )
+
     is_blocking = len(errors) > 0
     if is_blocking:
         summary = (
@@ -789,13 +762,19 @@ def _pre_flight_check(config: str, cloud: str = "") -> PreFlightCheckResponse:
         "cloud_readiness": cloud_readiness,
         "errors": errors,
         "warnings": warnings,
-        "paths": validate_paths(cfg, config_path.parent),
+        "paths": path_results,
     }
 
+    if dataset_checks:
+        result["dataset_checks"] = dataset_checks
+    if env_warnings:
+        result["env_warnings"] = env_warnings
+    if cloud_file_checks:
+        result["cloud_file_checks"] = cloud_file_checks
+
     if target_cloud:
-        model_name = cfg.get("model", {}).get("model_name", "")
         all_cfgs = get_all_configs()
-        suggested = search_configs_service(all_cfgs, query=model_name, limit=5)
+        suggested = search_configs_service(all_cfgs, query=target_cloud, limit=5)
         result["suggested_configs"] = [c["path"] for c in suggested]
 
     return result
@@ -806,9 +785,37 @@ def _looks_like_hf_repo(val: str) -> bool:
     return bool(val) and val.count("/") == 1 and not val.startswith(("/", ".", "~"))
 
 
-def validate_paths(cfg: dict, base_dir: Path) -> dict[str, bool]:
-    """Extract all local paths from config and validate they exist."""
-    paths: dict[str, bool] = {}
+def _is_local_machine_path(path_str: str) -> bool:
+    """Return True if *path_str* is a local machine absolute path.
+
+    Detects paths rooted at /Users/, /home/<local-user>/, or matching
+    Path.home(). Remote absolute paths (e.g. /home/ubuntu/...) are NOT
+    considered local.
+    """
+    p = Path(path_str)
+    if not p.is_absolute():
+        return False
+    home = Path.home()
+    if p == home or str(p).startswith(str(home) + "/"):
+        return True
+    if path_str.startswith("/Users/"):
+        return True
+    return False
+
+
+def validate_paths(cfg: dict, base_dir: Path, *, cloud: str = "") -> dict[str, str]:
+    """Extract all local paths from config and validate they exist.
+
+    For **local** jobs (``cloud == ""``): resolves relative paths against
+    *base_dir* and reports ``"ok"`` or ``"not_found"``.
+
+    For **cloud** jobs (``cloud != ""``): applies cloud path sanitization —
+    blocks local machine paths, accepts repo-relative and remote absolute paths.
+    Return values: ``"ok"``, ``"ok_remote"``, ``"not_found_warning"``,
+    ``"local_machine_path_error"``.
+    """
+    is_cloud = bool(cloud)
+    paths: dict[str, str] = {}
 
     def _extract(obj: Any) -> None:
         if isinstance(obj, dict):
@@ -818,20 +825,269 @@ def validate_paths(cfg: dict, base_dir: Path) -> dict[str, bool]:
                 ):
                     if _looks_like_hf_repo(val):
                         continue
-                    p = Path(val).expanduser()
-                    if not p.is_absolute():
-                        p = base_dir / p
-                        paths[f"{val} (resolved to {p})"] = p.exists()
+                    if is_cloud:
+                        _check_cloud_path(val)
                     else:
-                        paths[val] = p.exists()
+                        _check_local_path(val)
                 else:
                     _extract(val)
         elif isinstance(obj, list):
             for item in obj:
                 _extract(item)
 
+    def _check_local_path(val: str) -> None:
+        p = Path(val).expanduser()
+        if not p.is_absolute():
+            p = base_dir / p
+            paths[f"{val} (resolved to {p})"] = "ok" if p.exists() else "not_found"
+        else:
+            paths[val] = "ok" if p.exists() else "not_found"
+
+    def _check_cloud_path(val: str) -> None:
+        if _is_local_machine_path(val):
+            paths[val] = "local_machine_path_error"
+        elif Path(val).is_absolute():
+            # Remote absolute (e.g. /home/ubuntu/output/) — can't validate
+            paths[val] = "ok_remote"
+        else:
+            # Relative — check existence under project root (will be synced)
+            resolved = base_dir / val
+            paths[val] = "ok" if resolved.exists() else "not_found_warning"
+
     _extract(cfg)
     return paths
+
+
+def validate_datasets(cfg: dict) -> dict[str, str]:
+    """Validate dataset accessibility for each dataset in the config.
+
+    Mirrors Oumi's dataset resolution chain:
+    1. REGISTRY.get_dataset(name) → found in registry
+    2. dataset_path set → check local existence
+    3. datasets.load_dataset_builder(name) → HF Hub metadata probe (no download)
+
+    Returns a dict mapping dataset identifiers to status strings:
+    ``"ok_registry"``, ``"ok_local"``, ``"ok_hub"``, ``"not_found"``,
+    ``"warning_timeout"``.
+    """
+    data = cfg.get("data") or {}
+    results: dict[str, str] = {}
+
+    for split in ("train", "eval", "validation", "test"):
+        split_cfg = data.get(split) or {}
+        for ds in split_cfg.get("datasets") or []:
+            ds_name = ds.get("dataset_name", "")
+            ds_path = ds.get("dataset_path", "")
+
+            if not ds_name and not ds_path:
+                continue
+
+            key = ds_name or ds_path
+
+            if key in results:
+                continue
+
+            if ds_name:
+                try:
+                    from oumi.core.registry import REGISTRY
+
+                    reg_result = REGISTRY.get_dataset(ds_name)
+                    if reg_result is not None:
+                        results[key] = "ok_registry"
+                        continue
+                except Exception:
+                    pass
+
+            if ds_path:
+                p = Path(ds_path).expanduser()
+                if p.exists():
+                    results[key] = "ok_local"
+                    continue
+
+            if ds_name:
+                try:
+                    import datasets
+
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(datasets.load_dataset_builder, ds_name)
+                        future.result(timeout=5)
+                    results[key] = "ok_hub"
+                    continue
+                except TimeoutError:
+                    results[key] = "warning_timeout"
+                    continue
+                except Exception:
+                    pass
+
+            results[key] = "not_found"
+
+    return results
+
+
+def _check_env_overrides(cloud: str) -> list[str]:
+    """Check for environment variables that silently override config behavior.
+
+    Only relevant for cloud jobs. ``OUMI_USE_SPOT_VM`` and
+    ``OUMI_FORCE_EDITABLE_INSTALL`` are stripped at startup by
+    ``_strip_oumi_env_overrides()`` so they won't appear here.
+    """
+    if not cloud or cloud == "local":
+        return []
+
+    warnings: list[str] = []
+    _ENV_WARNINGS: dict[str, str] = {}
+    for var, msg in _ENV_WARNINGS.items():
+        val = os.environ.get(var)
+        if val:
+            warnings.append(f"Env var {var}={val!r} is set: {msg}")
+
+    return warnings
+
+
+def _check_skyignore(config_dir: Path, path_results: dict[str, str]) -> list[str]:
+    """Check if a .skyignore file might exclude files needed by the config.
+
+    Walks up from *config_dir* looking for ``.skyignore``. If found, parses
+    its patterns and warns if any config paths appear to match.
+    """
+    warnings: list[str] = []
+
+    skyignore_path: Path | None = None
+    search = config_dir.resolve()
+    for _ in range(10):  # limit depth
+        candidate = search / ".skyignore"
+        if candidate.is_file():
+            skyignore_path = candidate
+            break
+        parent = search.parent
+        if parent == search:
+            break
+        search = parent
+
+    if skyignore_path is None:
+        return warnings
+
+    try:
+        patterns = [
+            line.strip()
+            for line in skyignore_path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    except OSError:
+        return warnings
+
+    if not patterns:
+        return warnings
+
+    warnings.append(
+        f"Found .skyignore at {skyignore_path} — verify it doesn't exclude "
+        "files needed on the remote VM."
+    )
+
+    for path_key in path_results:
+        raw_path = path_key.split(" (resolved to")[0]
+        for pattern in patterns:
+            bare = pattern.rstrip("/")
+            if raw_path == bare or raw_path.startswith(bare + "/"):
+                warnings.append(
+                    f"Config path '{raw_path}' may be excluded by "
+                    f".skyignore pattern '{pattern}'"
+                )
+                break
+
+    return warnings
+
+
+def _check_cloud_files(cfg: dict, config_path: Path, cloud: str) -> dict[str, str]:
+    """Validate that files referenced in config will be available on the remote VM.
+
+    For **job-config passthrough** (has ``resources``/``setup``/``run`` keys):
+    validates ``file_mounts`` local sources exist and ``working_dir`` resolves
+    correctly.
+
+    For **training-config wrapping**: scans ``_dir``/``_path``/``_file`` values
+    and flags paths that have no delivery mechanism to the VM.
+
+    Returns a dict mapping paths to status strings.
+    """
+    if not cloud or cloud == "local":
+        return {}
+
+    results: dict[str, str] = {}
+    job_keys = {"resources", "setup", "run"}
+    is_job_cfg = bool(job_keys.intersection(cfg.keys()))
+
+    if is_job_cfg:
+        _check_job_config_files(cfg, config_path, results)
+    else:
+        _check_training_config_files(cfg, results)
+
+    return results
+
+
+def _check_job_config_files(
+    cfg: dict, config_path: Path, results: dict[str, str]
+) -> None:
+    """Validate file_mounts sources and working_dir for job-config passthrough."""
+    file_mounts = cfg.get("file_mounts") or {}
+    for remote_dest, local_src in file_mounts.items():
+        if not isinstance(local_src, str):
+            continue
+        expanded = Path(local_src).expanduser()
+        if expanded.exists():
+            results[local_src] = "ok"
+        else:
+            results[local_src] = "missing_local_source"
+
+    working_dir = cfg.get("working_dir")
+    if working_dir is not None:
+        wd_str = str(working_dir)
+        # working_dir: . is the correct portable default — client_cwd resolves it
+        # at launch time. Only flag truly broken values (nonexistent absolute paths).
+        if wd_str != ".":
+            wd_path = Path(wd_str).expanduser()
+            if not wd_path.is_absolute():
+                wd_path = config_path.parent / wd_path
+            if not wd_path.exists():
+                results[f"working_dir: {wd_str}"] = "working_dir_suspicious"
+
+
+def _check_training_config_files(cfg: dict, results: dict[str, str]) -> None:
+    """Flag training config paths that won't be delivered to the VM.
+
+    In wrapping mode, only config.yaml is staged. Any relative or local-absolute
+    path referencing data files will not exist on the remote VM.
+    """
+
+    def _extract_paths(obj: object) -> None:
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                if isinstance(val, str) and key.endswith(
+                    ("_dir", "_path", "_file", "_folder")
+                ):
+                    _classify(val)
+                else:
+                    _extract_paths(val)
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract_paths(item)
+
+    def _classify(val: str) -> None:
+        if not val or val.isspace():
+            return
+        if _looks_like_hf_repo(val) and "." not in val.split("/")[-1]:
+            return
+
+        p = Path(val)
+        if p.is_absolute():
+            if _is_local_machine_path(val):
+                results[val] = "not_reachable_on_vm"
+            else:
+                results[val] = "unverifiable_remote"
+        else:
+            results[val] = "not_reachable_on_vm"
+
+    _extract_paths(cfg)
 
 
 def get_repos(cfg: dict) -> dict[str, set[str]]:
@@ -1186,32 +1442,18 @@ def check_hardware(cfg: dict) -> tuple[list[str], list[str], HardwareInfo]:
 
 @mcp.tool()
 def validate_config(
-    config: str, task_type: ValidatorTaskType
+    config: str, task_type: ValidatorTaskType, client_cwd: str
 ) -> ValidateConfigResponse:
-    """Validate an Oumi YAML config file against its schema.
-
-    Use this to check if a config file is valid before running training,
-    evaluation, or inference. The validator checks required fields, types,
-    and cross-field constraints.
+    """Validate an Oumi YAML config against its schema.
 
     Args:
-        config: Absolute path to the YAML config file.
-                Example: "/path/to/train.yaml"
-        task_type: The type of config to validate against.
-                Options: training, evaluation, inference, tuning, synthesis,
-                         quantization, job, judge, analyze, async_evaluation
-
-    Returns:
-        Dict with:
-        - ok: True if the config is valid, False otherwise.
-        - error: Error message describing what's wrong (null if valid).
-
-    Examples:
-        - validate_config("/path/to/sft/train.yaml", "training")
-        - validate_config("/path/to/eval.yaml", "evaluation")
-        - validate_config("/path/to/infer.yaml", "inference")
+        config: Absolute path, or relative to client_cwd, to the YAML config file.
+        task_type: Config type: training, evaluation, inference, tuning,
+            synthesis, quantization, job, judge, analyze, async_evaluation.
+        client_cwd: REQUIRED. Absolute path to the client's working directory
+            (project root). Resolves relative config paths.
     """
-    config_path, path_error = _resolve_config_path(config)
+    config_path, path_error = _resolve_config_path(config, client_cwd)
     if path_error:
         return {"ok": False, "error": path_error}
     try:
@@ -1224,15 +1466,17 @@ def validate_config(
 
 @mcp.tool()
 def get_started() -> str:
-    """Get started with Oumi MCP - returns guidance for ML training workflows.
+    """Overview of all tools, resources, and recommended workflow.
 
-    Call this first when working with Oumi. Returns a guide explaining
-    how to use the available tools for finding and customizing training configs.
-
-    Returns:
-        Formatted guide with available tools, workflow steps, and examples.
+    CALL THIS FIRST — before using any other Oumi MCP tool.
+    Returns the full tool catalog, resource list, path-resolution rules,
+    and the correct order of operations for both local and cloud workflows.
     """
     return """# Oumi MCP - ML Training Config Server
+
+> **You called `get_started()` — good.** This is the required first step
+> before using any other Oumi MCP tool. Read through the workflow below
+> to understand tool ordering, path rules, and config usage guidelines.
 
 ## Available Tools
 
@@ -1241,22 +1485,38 @@ def get_started() -> str:
 |------|---------|---------|
 | `list_categories()` | See available models & config types | Start here |
 | `search_configs(query, task, model, keyword)` | Find training configs | `search_configs(model="llama3_1", task="sft")` |
-| `get_config(path, include_content)` | Get config details/YAML | `get_config("llama3_1/sft/8b_lora", include_content=True)` |
-| `validate_config(config, task_type)` | Validate before training | `validate_config("/path/to/config.yaml", "training")` |
-| `pre_flight_check(config, cloud)` | Catch issues before launch | `pre_flight_check("/path/to/config.yaml", cloud="gcp")` |
+| `get_config(path, include_content)` | Get a **reference** config (see usage note below) | `get_config("llama3_1/sft/8b_lora", include_content=True)` |
+| `validate_config(config, task_type, client_cwd)` | Validate before training | `validate_config("configs/train.yaml", "training", client_cwd="/home/user/project")` |
+| `pre_flight_check(config, client_cwd, cloud)` | Catch issues before launch | `pre_flight_check("configs/train.yaml", client_cwd="/home/user/project", cloud="gcp")` |
 | `get_docs(query, module, kind)` | Search Oumi Python API docs | `get_docs(["TrainingConfig"])` |
 | `list_modules()` | List indexed API modules | `list_modules()` |
 
 ### Execution
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `run_oumi_job(config, cmd)` | Execute Oumi command (dry-run by default) | `run_oumi_job("/path/to/config.yaml", "train")` |
+| `run_oumi_job(config, cmd, client_cwd)` | Execute Oumi command (dry-run by default) | `run_oumi_job("configs/train.yaml", "train", client_cwd="/home/user/project")` |
 | `get_job_status(job_id)` | Status snapshot (no streaming) | `get_job_status("train_20260206_...")` |
 | `get_job_logs(job_id, lines)` | Tail log snapshot | `get_job_logs("train_20260206_...", lines=200)` |
 | `cancel_job(job_id)` | Cancel a running job | `cancel_job("train_20260206_...")` |
 | `list_jobs()` | List running and completed jobs | `list_jobs(status="running")` |
 | `stop_cluster(cloud, cluster_name)` | Stop cluster (preserves infra, reduces compute cost) | `stop_cluster("gcp", "sky-xxxx")` |
 | `down_cluster(cloud, cluster_name, confirm, user_confirmation)` | Delete cluster entirely — irreversible | `down_cluster("gcp", "sky-xxxx", confirm=True, user_confirmation="DOWN")` |
+
+### ⚠️  How to use `get_config` correctly
+
+Configs returned by `get_config(path, include_content=True)` are **reference
+recipes** — they show you the correct YAML structure, field names, and sensible
+defaults for a given model/task combination. **Do NOT copy them verbatim.**
+
+Instead:
+1. Study the structure and note which fields are relevant to the user's task.
+2. Build a NEW config from scratch, adapting only the settings that apply
+   (model name, dataset, training params, PEFT config, output dir).
+3. Customize values for the user's specific hardware, data, and goals.
+4. Omit sections that don't apply (e.g., drop `peft:` for full fine-tuning).
+
+Copying a reference config wholesale leads to wrong datasets, wrong output
+paths, unnecessary settings, and confused users.
 
 ## MCP Resources
 
@@ -1269,6 +1529,8 @@ def get_started() -> str:
 | `guidance://mle-analyze` | Dataset analysis, bias/quality checks | Before training, data audit |
 | `guidance://mle-eval` | Evaluation strategies, benchmarks | Benchmarking or comparing runs |
 | `guidance://mle-infer` | Inference best practices, latency tuning | Running inference or sanity checks |
+| `guidance://cloud-launch` | Cloud job config anatomy, setup patterns | Before launching a cloud training run |
+| `guidance://post-training` | Download weights, evaluate, teardown, merge LoRA | After cloud training succeeds |
 
 ### Jobs
 | Resource | What it contains |
@@ -1279,26 +1541,44 @@ def get_started() -> str:
 
 ## ⚠️  CRITICAL: Working Directory and Paths
 
-**Jobs run from a different working directory than your project root.**
-- **Config file path**: MUST be absolute (e.g., `/home/user/config.yaml` or `~/my_config.yaml`)
-- **Paths inside config**: Also use absolute paths (dataset_path, output_dir, validation_path, etc.)
-  - ❌ BAD: `dataset_path: pubmedqa/train.jsonl` → will fail with "file not found"
-  - ✅ GOOD: `dataset_path: /home/user/data/pubmedqa/train.jsonl`
-  - ✅ GOOD: `dataset_path: ~/data/pubmedqa/train.jsonl` (~ is expanded)
+**The MCP server runs in a DIFFERENT directory than the user's project.**
+You MUST pass `client_cwd` (absolute path to the project root) to all path-sensitive tools.
 
-For **cloud jobs**, paths inside the job config are relative to `working_dir` (synced to the remote VM).
+**What `client_cwd` does:**
+- Resolves relative config paths (e.g. `configs/train.yaml` → `/home/user/project/configs/train.yaml`)
+- Sets the subprocess working directory for local jobs
+- Becomes the `working_dir` synced to the remote VM for cloud jobs
+
+**Example:** If the user's project is at `/home/user/my-project`:
+```
+validate_config("configs/train.yaml", "training", client_cwd="/home/user/my-project")
+run_oumi_job("configs/train.yaml", "train", client_cwd="/home/user/my-project")
+```
+
+**Paths inside configs:**
+- **Local jobs**: absolute or relative to `client_cwd` (resolved at runtime)
+- **Cloud jobs**: repo-relative paths only (resolve from `working_dir` on the remote VM)
+  - ❌ BAD: `/Users/you/data/train.jsonl` — doesn't exist on the VM
+  - ✅ GOOD: `data/train.jsonl` — resolves from synced `working_dir`
 
 ## ☁️  Cloud Job Workflow (REQUIRED — follow this order)
 
 **When a user asks to run a cloud training job, ALWAYS follow these steps:**
 
 ```
-Step 1: pre_flight_check("~/my_config.yaml", cloud="gcp")
+CWD = "/home/user/my-project"  # user's project root — pass as client_cwd everywhere
+
+Step 1: pre_flight_check("configs/train.yaml", client_cwd=CWD, cloud="gcp")
         # → check credentials, then use suggested_configs paths with get_config() for reference YAMLs
-Step 2: [create ~/my_job.yaml based on a reference config or from scratch]
-Step 3: [customize: resources.accelerators, working_dir, run, envs, file_mounts]
-Step 4: run_oumi_job("~/my_job.yaml", "train")           # dry_run=True (default) — shows full JobConfig
-Step 5: run_oumi_job("~/my_job.yaml", "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")
+Step 2: run_oumi_job("configs/train.yaml", "train", client_cwd=CWD, cloud="gcp")    # dry_run (default)
+        # → returns a complete job config YAML template with TODO markers
+Step 3: Save the template as job.yaml in the project, customize TODO sections
+        (setup, storage_mounts, envs)
+        OR pass setup_script/run_script overrides inline
+        Note: working_dir is auto-set from client_cwd for training configs
+Step 4: run_oumi_job("job.yaml", "train", client_cwd=CWD, cloud="gcp")       # dry_run to verify
+Step 5: run_oumi_job("job.yaml", "train", client_cwd=CWD, cloud="gcp",
+        dry_run=False, confirm=True, user_confirmation="EXECUTE")
 Step 6: get_job_status(job_id)                           # poll status
 Step 7: get_job_logs(job_id, lines=200)                  # check logs
 Step 8: [when done] stop_cluster("gcp", cluster_name)   # pause OR
@@ -1306,33 +1586,35 @@ Step 8: [when done] stop_cluster("gcp", cluster_name)   # pause OR
 ```
 
 **Key fields to customize in your cloud job YAML:**
-- `resources.accelerators` — GPU type and count (e.g. `"A100:8"`, `"H100:4"`)
-- `working_dir` — absolute path to your local project (synced to remote)
+- `resources.accelerators` — GPU type and count (e.g. `"A10G:1"`, `"A100:8"`)
+- `working_dir` — use `.` (default); resolved to `client_cwd` at launch time
 - `run` — your oumi command (path relative to `working_dir`)
 - `envs` — API keys (WANDB_API_KEY, HF_TOKEN) that won't be forwarded automatically
-- `file_mounts` — credential files to sync (HF token, .netrc auto-included)
+- `file_mounts` — credential files auto-included; **add local dataset files** if not git-tracked
+  - Example: `~/sky_workdir/data/train.jsonl: /Users/you/data/train.jsonl`
 
-**Tip:** `pre_flight_check(config, cloud="gcp")` returns `suggested_configs` — a list of
-library config paths for the same model family. Call `get_config(path, include_content=True)`
-on any of those paths to get a full YAML reference you can adapt for your cloud job.
+**Tip:** Read `guidance://cloud-launch` for detailed job config field explanations and common
+setup patterns (dataset downloads, extra packages, storage mounts).
 
 ## Local Quickstart Workflow
 
 1. **Discover models**: `list_categories()` -> see model_families
 2. **Find recipes**: `search_configs(model="llama3_1", task="sft")`
-3. **Get YAML**: `get_config("llama3_1/sft/8b_lora", include_content=True)`
-4. **Customize**: Modify model_name, datasets, output_dir — use absolute paths
-5. **Validate**: `validate_config("/your/config.yaml", "training")`
-6. **Preview**: `run_oumi_job("/your/config.yaml", "train")` -> dry-run (default)
-7. **Execute**: `run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")`
+3. **Study reference**: `get_config("llama3_1/sft/8b_lora", include_content=True)` — read for structure and defaults, do NOT copy verbatim
+4. **Build config**: Create a new config for the user's specific model, dataset, hardware, and goals — use the reference to inform field names and reasonable values
+5. **Validate**: `validate_config("configs/train.yaml", "training", client_cwd="/home/user/project")`
+6. **Preview**: `run_oumi_job("configs/train.yaml", "train", client_cwd="/home/user/project")` -> dry-run (default)
+7. **Execute**: `run_oumi_job("configs/train.yaml", "train", client_cwd="/home/user/project", dry_run=False, confirm=True, user_confirmation="EXECUTE")`
 8. **Check status**: `get_job_status("train_20260206_...")`
 9. **Get logs**: `get_job_logs("train_20260206_...", lines=200)`
 
 ## Execution Pattern
 
 ```
-Step 1 (preview):  run_oumi_job(config, "train")                                    # dry_run=True
-Step 2 (execute):  run_oumi_job(config, "train", dry_run=False, confirm=True, user_confirmation="EXECUTE")
+CWD = "/home/user/project"  # always pass client_cwd
+
+Step 1 (preview):  run_oumi_job(config, "train", client_cwd=CWD)                                    # dry_run=True
+Step 2 (execute):  run_oumi_job(config, "train", client_cwd=CWD, dry_run=False, confirm=True, user_confirmation="EXECUTE")
 Step 3 (status):   get_job_status(job_id)
 Step 4 (logs):     get_job_logs(job_id, lines=200)
 Step 5 (cancel):   cancel_job(job_id)
@@ -1364,10 +1646,44 @@ Step 2b (delete): down_cluster("gcp", "sky-xxxx", confirm=True, user_confirmatio
 
 When customizing a config, these are the key fields to modify:
 - `model.model_name`: HuggingFace model ID
-- `data.train.datasets`: Your dataset name/path
+- `data.train.datasets`: Dataset list (see dataset_name below)
 - `training.output_dir`: Where to save checkpoints
 - `training.learning_rate`: Start with recipe default
 - `training.per_device_train_batch_size`: Adjust for your GPU memory
+
+## ⚠️  dataset_name: Use Registry Names, NOT Class Names
+
+For local JSONL files, use `dataset_name: "text_sft_jsonl"` with `dataset_path` pointing to the file:
+```yaml
+data:
+  train:
+    datasets:
+      - dataset_name: "text_sft_jsonl"
+        dataset_path: "pubmedqa/train.jsonl"
+```
+- WRONG: `TextSftJsonLinesDataset`, `TextSftJsonlDataset` — these are Python class names, not registry names
+- For HuggingFace datasets: use the full HF ID (e.g. `yahma/alpaca-cleaned`) as dataset_name
+- Use `get_docs(["dataset"])` to search for other registered dataset names
+
+## ⚠️  LoRA/QLoRA: MUST set `use_peft: True`
+
+When using LoRA or QLoRA, you MUST set BOTH:
+1. The `peft:` config block (lora_r, lora_alpha, lora_target_modules, etc.)
+2. `training.use_peft: True`
+
+Without `use_peft: True`, the `peft:` block is **silently ignored** and full fine-tuning runs
+instead — using ~4x more VRAM and likely OOMing on smaller GPUs (e.g. A10G with 8B model).
+
+## GPU VRAM Quick Reference
+
+| Model Size | Full Fine-Tune | LoRA | QLoRA |
+|-----------|---------------|------|-------|
+| 3B | 24 GB | 12 GB | 8 GB |
+| 7-8B | 60 GB | 20 GB | 14 GB |
+| 13B | 100 GB | 32 GB | 20 GB |
+| 70B | 400 GB+ | 80 GB | 48 GB |
+
+Common cloud GPUs: A10G (22 GB), L4 (24 GB), A100 (40/80 GB), H100 (80 GB).
 """
 
 
@@ -1388,6 +1704,7 @@ def _jobconfig_to_yaml(jc: launcher.JobConfig) -> str:
 async def run_oumi_job(
     config_path: str,
     command: str,
+    client_cwd: str,
     dry_run: bool = True,
     confirm: bool = False,
     user_confirmation: str = "",
@@ -1400,118 +1717,46 @@ async def run_oumi_job(
     disk_size: int | None = None,
     use_spot: bool = False,
     num_nodes: int = 1,
+    setup_script: str = "",
+    run_script: str = "",
 ) -> JobSubmissionResponse:
     """Execute an Oumi CLI command with background job tracking.
 
-    **Two-step safety pattern:**
-    1. Call with ``dry_run=True`` (default) to preview the execution plan
-       without running anything.  Returns model name,
-       output directory, and the exact CLI command that would be invoked.
-    2. Call with ``dry_run=False, confirm=True`` to actually launch the job.
-       You must also provide ``user_confirmation="EXECUTE"`` to explicitly
-       authorize execution. The process runs in the background and returns
-       a ``job_id`` immediately.
-       For cloud runs, a pre-flight check is executed and may block launch.
+    Two-step safety: call with dry_run=True (default) to preview, then
+    dry_run=False, confirm=True, user_confirmation="EXECUTE" to launch.
+    Cloud runs execute a pre-flight check that may block launch.
 
-    **Config type auto-detection:**
-    If *config_path* is a launcher job config (contains ``resources``, ``setup``,
-    or ``run`` keys at the top level), it is passed directly to ``oumi launch up``
-    preserving all cloud-specific fields (``envs``, ``file_mounts``,
-    ``storage_mounts``, ``disk_size``, ``use_spot``, etc.).  Otherwise the config
-    is treated as a training config and wrapped in a minimal cloud job config,
-    enriched with any caller-supplied *envs*, *file_mounts*, and other params.
-
-    **Credential propagation:**
-    Common credential files (``~/.cache/huggingface/token``, ``~/.netrc``) are
-    automatically mounted on the remote VM when they exist locally, so HuggingFace
-    and WandB auth work without manual configuration. Environment variables from
-    your local shell are **not** forwarded automatically to cloud jobs; pass them
-    explicitly via ``envs``.
-
-    Use ``get_job_status(job_id)`` for a status snapshot.
-    Use ``get_job_logs(job_id, lines=...)`` for a bounded log snapshot.
-    Use ``cancel_job(job_id)`` to stop a running job.
-    Use ``list_jobs()`` to see all running and completed jobs.
+    Job configs (with ``resources``/``setup``/``run`` keys) pass through
+    directly to ``oumi launch up``. Training configs are auto-wrapped.
+    HF/WandB credentials are auto-mounted on cloud VMs.
 
     Args:
-        config_path: Absolute path to a validated Oumi YAML config file.
-                     IMPORTANT: Must be absolute (e.g., /home/user/config.yaml)
-                     or expanded with ~ (e.g., ~/my_config.yaml).
-                     Relative paths will be rejected.
-                     **Also ensure paths inside the config (dataset_path, output_dir, etc.)
-                     are absolute**, since the job runs from a different working
-                     directory than your project root.
-                     If this is already a launcher job config (has ``resources``/
-                     ``setup``/``run`` keys), it is passed through directly.
-        command: Which Oumi subcommand to run.  One of:
-            train, analyze, synth, evaluate, eval, infer, tune, quantize.
-            Ignored when *config_path* is a job config (the run script is
-            taken from the config itself).
-        dry_run: If True (default), validate and return an execution plan
-            without running anything.  Always start here.
-        confirm: Must be True for actual execution.  Acts as a safety gate
-            so the agent cannot accidentally launch GPU-hours of training.
-        user_confirmation: Required explicit approval phrase for execution.
-            Must be exactly ``"EXECUTE"`` when ``dry_run=False``.
-        job_name: Optional human-readable name for the job.  If omitted, a
-            name is generated from the command and timestamp.
-        cloud: Execution target cloud. ``"local"`` runs locally; any other
-            value launches through ``oumi.launcher``.
-        cluster_name: Optional cluster name for cloud launches.
-        accelerators: Optional accelerator request string for cloud launches
-            (e.g. ``"A100:8"``).  Multi-GPU specs automatically enable
-            ``oumi distributed torchrun``.
-        envs: Environment variables to set on the remote VM
-            (e.g. ``{"WANDB_PROJECT": "my-project"}``).
-        file_mounts: Additional local→remote file mappings
-            (e.g. ``{"~/.ssh/id_rsa": "~/.ssh/id_rsa"}``).
-            Common credential files are auto-mounted by default.
+        config_path: Absolute path, or relative to client_cwd, to an Oumi YAML config.
+        command: Oumi subcommand: train, analyze, synth, evaluate, eval,
+            infer, tune, quantize. Ignored for job configs.
+        client_cwd: REQUIRED. Absolute path to the client's working directory
+            (project root). Resolves relative config paths. For local jobs, the
+            Oumi CLI subprocess runs from this directory. For cloud jobs, this
+            directory is synced to the remote VM as the working directory.
+        dry_run: Preview execution plan without running (default True).
+        confirm: Must be True for actual execution.
+        user_confirmation: Must be ``"EXECUTE"`` when dry_run=False.
+        job_name: Optional name; auto-generated if omitted.
+        cloud: ``"local"`` (default) or a cloud provider name.
+        cluster_name: Cluster name for cloud launches.
+        accelerators: Accelerator spec, e.g. ``"A100:8"``. Multi-GPU
+            auto-enables ``oumi distributed torchrun``.
+        envs: Env vars for the remote VM.
+        file_mounts: Additional local-to-remote file mappings. Use for local
+            dataset files not git-tracked in working_dir (e.g.
+            ``{"~/sky_workdir/data/train.jsonl": "/abs/path/to/train.jsonl"}``).
         disk_size: Disk size in GB for the remote VM.
-        use_spot: Use spot/preemptible instances (cheaper but can be
-            preempted).  Default: False.
-        num_nodes: Number of nodes for distributed training.  Default: 1.
-            Values > 1 automatically enable ``oumi distributed torchrun``.
-    Returns:
-        JobSubmissionResponse with job_id, status, model info, and either
-        an execution plan (dry_run) or a submission confirmation.
-
-    Examples:
-        # Step 1: Preview what would happen
-        run_oumi_job("/path/to/train.yaml", "train")
-
-        # Step 2: Execute for real
-        run_oumi_job(
-            "/path/to/train.yaml",
-            "train",
-            dry_run=False,
-            confirm=True,
-            user_confirmation="EXECUTE",
-        )
-
-        # Step 3: Monitor progress
-        get_job_status("train_20260206_143022_a1b2c3")
-
-        # Cloud job with job config passthrough (all cloud fields preserved)
-        run_oumi_job(
-            "~/configs/gcp_job.yaml",
-            "train",
-            cloud="gcp",
-            dry_run=False,
-            confirm=True,
-            user_confirmation="EXECUTE",
-        )
-
-        # Cloud job with multi-GPU distributed training
-        run_oumi_job(
-            "~/configs/train.yaml",
-            "train",
-            cloud="gcp",
-            accelerators="A100:8",
-            envs={"WANDB_PROJECT": "my-run"},
-            dry_run=False,
-            confirm=True,
-            user_confirmation="EXECUTE",
-        )
+        use_spot: Use spot/preemptible instances.
+        num_nodes: Node count for distributed training.
+        setup_script: Override default cloud setup script (training-config
+            wrapping mode only).
+        run_script: Override auto-generated run command (training-config
+            wrapping mode only).
     """
     command = command.strip().lower()
     cloud = cloud.strip().lower() or "local"
@@ -1541,7 +1786,7 @@ async def run_oumi_job(
             f"Must be one of: {sorted(VALID_OUMI_COMMANDS)}"
         )
 
-    config_file, path_error = _resolve_config_path(config_path)
+    config_file, path_error = _resolve_config_path(config_path, client_cwd)
     if path_error:
         return _error_response(path_error)
 
@@ -1567,19 +1812,12 @@ async def run_oumi_job(
 
     is_job_config_file = _is_job_config(config_file) if cloud != "local" else False
 
-    num_gpus_preview = 0
-    if accelerators:
-        try:
-            num_gpus_preview = (
-                int(accelerators.split(":")[-1]) if ":" in accelerators else 1
-            )
-        except (ValueError, IndexError):
-            num_gpus_preview = 1
+    num_gpus = _parse_gpu_count(accelerators or None)
 
     if dry_run:
         if is_job_config_file:
             cmd_preview = f"oumi launch up -c {abs_config}"
-        elif num_gpus_preview > 1 or num_nodes > 1:
+        elif num_gpus > 1 or num_nodes > 1:
             cmd_preview = f"oumi distributed torchrun -m oumi {command} -c {abs_config}"
         else:
             cmd_preview = f"oumi {command} -c {abs_config}"
@@ -1603,33 +1841,47 @@ async def run_oumi_job(
                     job_cfg_yaml = _jobconfig_to_yaml(preview_job_cfg)
                 except Exception:
                     job_cfg_yaml = "(could not parse job config for preview)"
-            else:
-                preview_mounts = _default_file_mounts()
-                if file_mounts:
-                    preview_mounts.update(file_mounts)
-                preview_job_cfg = _build_cloud_job_config(
-                    "config.yaml",
-                    command,
-                    cloud=cloud,
-                    working_dir="<staging dir set at launch>",
-                    accelerators=accelerators or None,
-                    job_name=job_id,
-                    envs=envs,
-                    file_mounts=preview_mounts,
-                    disk_size=disk_size,
-                    use_spot=use_spot,
-                    num_nodes=num_nodes,
+                message = (
+                    message
+                    + "\n\n--- Generated JobConfig (review before executing) ---\n"
+                    + job_cfg_yaml
+                    + "-----------------------------------------------------"
                 )
-                job_cfg_yaml = _jobconfig_to_yaml(preview_job_cfg)
+            else:
+                job_config_template = _generate_job_config_template(
+                    abs_config,
+                    command,
+                    cloud,
+                    model_name,
+                    client_cwd=client_cwd,
+                    job_name=job_id,
+                    accelerators=accelerators,
+                    num_nodes=num_nodes,
+                    envs=envs,
+                    setup_script=setup_script,
+                    run_script=run_script,
+                )
                 env_warning = _build_missing_env_warning(envs)
                 if env_warning:
                     message = message + env_warning
-            message = (
-                message
-                + "\n\n--- Generated JobConfig (review before executing) ---\n"
-                + job_cfg_yaml
-                + "-----------------------------------------------------"
-            )
+                message = (
+                    message
+                    + "\n\n--- Job Config Template (save as YAML, customize TODO sections, re-submit) ---\n"
+                    + job_config_template
+                    + "\n----------------------------------------------------------------------\n"
+                    + "\nNEXT STEPS:\n"
+                    + "1. Save the template above as a job config YAML file (e.g., my_job.yaml in the project)\n"
+                    + "2. Customize the TODO sections (setup, file_mounts for data, storage_mounts, envs)\n"
+                    + "   - Mount local dataset files via file_mounts if they're not git-tracked\n"
+                    + "   - If using LoRA/QLoRA, ensure training.use_peft: True is set in your training config\n"
+                    + "3. Re-submit with the job config: run_oumi_job('my_job.yaml', '"
+                    + command
+                    + "', client_cwd=<project_root>, cloud='"
+                    + cloud
+                    + "')\n"
+                    + "\nAlternatively, pass setup_script and run_script overrides inline to skip the file roundtrip.\n"
+                    + "Read guidance://cloud-launch for detailed field explanations, GPU sizing, and setup patterns."
+                )
         return {
             "success": True,
             "job_id": job_id,
@@ -1668,7 +1920,7 @@ async def run_oumi_job(
     preflight_warnings: list[str] = []
 
     if cloud != "local":
-        preflight = _pre_flight_check(abs_config, cloud=cloud)
+        preflight = _pre_flight_check(abs_config, client_cwd=client_cwd, cloud=cloud)
         preflight_summary = preflight.get("summary", "")
         preflight_blocking = bool(preflight.get("blocking"))
         preflight_errors = preflight.get("errors", []) or []
@@ -1685,12 +1937,7 @@ async def run_oumi_job(
                     "Gated model downloads will fail on the remote VM."
                 )
 
-            num_gpus_for_check = (
-                int(accelerators.split(":")[-1])
-                if accelerators and ":" in accelerators
-                else (1 if accelerators else 0)
-            )
-            if num_gpus_for_check > 1 or num_nodes > 1:
+            if num_gpus > 1 or num_nodes > 1:
                 preflight_warnings.append(
                     f"Multi-GPU/multi-node job detected (accelerators={accelerators!r}, "
                     f"num_nodes={num_nodes}). Using `oumi distributed torchrun` automatically."
@@ -1749,7 +1996,7 @@ async def run_oumi_job(
     is_local = cloud == "local"
     if is_local:
         try:
-            start_local_job(record, rt)
+            start_local_job(record, rt, client_cwd=client_cwd)
         except Exception as exc:
             rt.error_message = str(exc)
             reg.update(record.job_id, status="failed")
@@ -1768,12 +2015,15 @@ async def run_oumi_job(
             launch_job(
                 record,
                 rt,
+                client_cwd=client_cwd,
                 accelerators=accelerators or None,
                 envs=envs,
                 file_mounts=file_mounts,
                 disk_size=disk_size,
                 use_spot=use_spot,
                 num_nodes=num_nodes,
+                setup_script=setup_script or None,
+                run_script=run_script or None,
             ),
             name=f"oumi-job-{job_id}",
         )
@@ -1796,7 +2046,6 @@ async def run_oumi_job(
         command,
     )
 
-    # Re-read record in case cloud launch updated it
     record = reg.get(job_id) or record
 
     if rt.error_message and not is_local:
@@ -2138,8 +2387,44 @@ async def get_job_logs(
         cluster_name=cluster_name,
     )
     if not record:
+        # Direct cloud log retrieval for untracked jobs (bypasses registry)
+        if oumi_job_id and cloud and cluster_name:
+            ephemeral = JobRecord(
+                job_id=oumi_job_id,
+                command="",
+                config_path="",
+                cloud=cloud,
+                cluster_name=cluster_name,
+                oumi_job_id=oumi_job_id,
+                model_name="",
+                status="unknown",
+                submit_time="",
+            )
+            cloud_result = await _get_cloud_logs(ephemeral, JobRuntime(), lines)
+            if cloud_result is not None:
+                cloud_logs, cloud_lines = cloud_result
+                return {
+                    "success": True,
+                    "job_id": oumi_job_id,
+                    "lines_requested": lines,
+                    "lines_returned": cloud_lines,
+                    "log_file": f"cloud:{cloud}/{cluster_name}",
+                    "logs": cloud_logs,
+                    "error": None,
+                }
+            return {
+                "success": False,
+                "job_id": oumi_job_id,
+                "lines_requested": lines,
+                "lines_returned": 0,
+                "log_file": "",
+                "logs": "",
+                "error": (
+                    f"Cloud log retrieval failed for {cloud}/{cluster_name}. "
+                    f"The cluster may no longer exist or SSH timed out."
+                ),
+            }
         if oumi_job_id and cloud:
-            cluster_hint = cluster_name or "<cluster>"
             return {
                 "success": False,
                 "job_id": job_id or oumi_job_id,
@@ -2148,8 +2433,8 @@ async def get_job_logs(
                 "log_file": "",
                 "logs": "",
                 "error": (
-                    "No MCP-managed local log file for this cloud job identity. "
-                    f"Use `sky logs {cluster_hint}` to stream logs directly."
+                    "cluster_name is required for direct cloud log retrieval. "
+                    "Provide oumi_job_id + cloud + cluster_name."
                 ),
             }
         return {
@@ -2169,6 +2454,33 @@ async def get_job_logs(
     resolved_job_id = record.job_id
 
     if not stdout_path or not stdout_path.exists():
+        # Cloud fallback: fetch logs from cluster via get_logs_stream
+        if record.cloud and record.cloud != "local":
+            cloud_result = await _get_cloud_logs(record, rt, lines)
+            if cloud_result is not None:
+                cloud_logs, cloud_lines = cloud_result
+                return {
+                    "success": True,
+                    "job_id": resolved_job_id,
+                    "lines_requested": lines,
+                    "lines_returned": cloud_lines,
+                    "log_file": f"cloud:{record.cloud}/{record.cluster_name}",
+                    "logs": cloud_logs,
+                    "error": None,
+                }
+            return {
+                "success": False,
+                "job_id": resolved_job_id,
+                "lines_requested": lines,
+                "lines_returned": 0,
+                "log_file": "",
+                "logs": "",
+                "error": (
+                    "No local log file and cloud log retrieval failed. "
+                    f"The cluster '{record.cluster_name}' may no longer exist. "
+                    f"Try `sky logs {record.cluster_name}` directly."
+                ),
+            }
         return {
             "success": False,
             "job_id": resolved_job_id,
@@ -2215,27 +2527,15 @@ async def cancel_job(
 ) -> JobCancelResponse:
     """Cancel a running or pending Oumi job.
 
-    For local jobs, sends SIGTERM to the subprocess.  Use ``force=True``
-    to send SIGKILL instead if the process won't stop.
-
-    For cloud jobs, delegates to ``oumi.launcher.cancel()``.
+    Local jobs: SIGTERM (or SIGKILL with force=True).
+    Cloud jobs: delegates to ``oumi.launcher.cancel()``.
 
     Args:
-        job_id: The MCP job ID to cancel (preferred).
-        force: If True, send SIGKILL instead of SIGTERM (local jobs only).
-        oumi_job_id: Optional cluster-side job ID for direct cloud cancellation.
-        cloud: Cloud provider name when using ``oumi_job_id``.
-        cluster_name: Optional cluster name when using ``oumi_job_id``.
-
-    Returns:
-        Dict with success status and message/error.
-
-    Examples:
-        # Graceful cancellation
-        cancel_job("train_20260206_143022_a1b2c3")
-
-        # Force kill
-        cancel_job("train_20260206_143022_a1b2c3", force=True)
+        job_id: MCP job ID (preferred).
+        force: SIGKILL instead of SIGTERM (local only).
+        oumi_job_id: Cluster-side job ID for direct cloud cancellation.
+        cloud: Cloud provider when using ``oumi_job_id``.
+        cluster_name: Cluster name when using ``oumi_job_id``.
     """
     cloud = cloud.strip().lower()
     cluster_name = cluster_name.strip()
@@ -2299,19 +2599,12 @@ async def cancel_job(
 async def stop_cluster(cloud: str, cluster_name: str) -> ClusterLifecycleResponse:
     """Stop a running cluster, preserving infra and reducing compute cost.
 
-    Stopped clusters keep their storage but no longer consume compute resources.
-    They can be restarted by submitting a new job with the same ``cluster_name``.
-
-    Use ``down_cluster`` to fully delete the cluster and stop all billing.
-
-    Get the cluster name from ``get_job_status(job_id)["cluster"]`` or ``list_jobs()``.
+    Restart by submitting a new job with the same cluster_name.
+    Use ``down_cluster`` to fully delete and stop all billing.
 
     Args:
-        cloud: Cloud provider (e.g. ``"gcp"``, ``"aws"``, ``"azure"``).
+        cloud: Cloud provider (e.g. ``"gcp"``, ``"aws"``).
         cluster_name: Name of the cluster to stop.
-
-    Returns:
-        ClusterLifecycleResponse with ``success`` and ``message`` or ``error``.
     """
     cloud = cloud.strip().lower()
     cluster_name = cluster_name.strip()
@@ -2345,24 +2638,17 @@ async def down_cluster(
     confirm: bool = False,
     user_confirmation: str = "",
 ) -> ClusterLifecycleResponse:
-    """Delete a cluster and all its resources. This is irreversible.
+    """IRREVERSIBLE: delete a cluster and all its resources.
 
-    WARNING: All data on the cluster is permanently deleted and billing stops
-    immediately. This cannot be undone. Use ``stop_cluster`` to pause instead.
-
-    Requires ``confirm=True`` and ``user_confirmation="DOWN"`` to execute.
-    Call without these to see a dry-run description of what would be deleted.
-
-    Get the cluster name from ``get_job_status(job_id)["cluster"]`` or ``list_jobs()``.
+    Requires ``confirm=True`` and ``user_confirmation="DOWN"``.
+    Without these, returns a dry-run description.
+    Use ``stop_cluster`` to pause without deleting.
 
     Args:
-        cloud: Cloud provider (e.g. ``"gcp"``, ``"aws"``, ``"azure"``).
+        cloud: Cloud provider (e.g. ``"gcp"``, ``"aws"``).
         cluster_name: Name of the cluster to delete.
-        confirm: Must be ``True`` for actual deletion.
-        user_confirmation: Must be exactly ``"DOWN"`` to authorize deletion.
-
-    Returns:
-        ClusterLifecycleResponse with ``success`` and ``message`` or ``error``.
+        confirm: Must be True for actual deletion.
+        user_confirmation: Must be exactly ``"DOWN"``.
     """
     cloud = cloud.strip().lower()
     cluster_name = cluster_name.strip()
@@ -2408,23 +2694,8 @@ async def list_jobs(
 ) -> list[JobSummary]:
     """List running and completed jobs.
 
-    Use this to see what jobs have been submitted, their current status,
-    and whether they are still running or have finished.
-
     Args:
-        status: Filter by job status.  One of:
-            ``"all"`` (default) -- all jobs,
-            ``"running"`` -- only in-progress jobs,
-            ``"completed"`` -- only finished jobs.
-
-    Returns:
-        List of job summaries with job_id, command, status, cloud,
-        cluster, model_name, and is_done.
-
-    Examples:
-        list_jobs()                  # All jobs
-        list_jobs(status="running")  # Only running jobs
-        list_jobs(status="completed")  # Only finished jobs
+        status: ``"all"`` (default), ``"running"``, or ``"completed"``.
     """
     return await _list_job_summaries(status_filter=status)
 
@@ -2437,54 +2708,18 @@ def get_docs(
     limit: int = 10,
     summarize: bool = False,
 ) -> DocsSearchResponse:
-    """Search Oumi's indexed Python API docs for agent tool discovery.
+    """Search Oumi's indexed Python API docs.
 
-    This tool is optimized for agents that need to discover API surface area
-    quickly and with minimal context switching. It searches an in-memory index
-    of classes, dataclasses, functions, and methods across the modules listed
-    by ``list_modules()``.
-
-    Matching strategy (in order):
-    1. Exact qualified name match
-       Example: ``oumi.core.configs.params.training_params.TrainingParams``
-    2. Exact short-name match (case-insensitive)
-       Example: ``TrainingParams``
-    3. Relevance-ranked keyword search over names, dataclass fields, summaries,
-       and docstring sections
-       Example: ``learning_rate``
-
-    Agent discovery workflow:
-    1. Call ``list_modules()`` to discover indexed namespaces.
-    2. Call ``get_docs(query, module=..., kind=...)`` to narrow results.
-    3. Read ``signature``, ``fields``, and ``sections`` from returned entries
-       to infer valid parameters and usage patterns.
+    Matches by: (1) exact qualified name, (2) exact short name, then
+    (3) relevance-ranked keyword search over names, fields, and docstrings.
 
     Args:
-        query: Search terms. Include one or more exact qualified names,
-               short names, or keywords. Examples:
-               ["oumi.core.configs.TrainingConfig"], ["TrainingConfig"],
-               ["learning_rate", "lora"].
-        module: Optional module prefix filter (e.g. "oumi.core.configs").
-        kind: Optional kind filter: "class", "dataclass", "function", or "method".
-        limit: Maximum number of results to return (default 10).
-        summarize: If True, return compact entries that focus on high-level
-            metadata and summary text (omits fields and docstring sections).
-
-    Returns:
-        DocsSearchResponse with:
-        - results: Matching documentation entries with name, kind, summary,
-          fields (for dataclasses), signature, and parsed docstring sections.
-        - query: The normalized query terms used for this search.
-        - total_matches: Total matches before limiting.
-        - index_ready: False if background indexing hasn't finished yet.
-        - error: Error message if something went wrong.
-
-    Examples:
-        - get_docs(["TrainingConfig"]) -> Full TrainingConfig docs with fields
-        - get_docs(["ModelParams"]) -> ModelParams with per-field docstrings
-        - get_docs(["learning_rate", "lora"]) -> Multi-keyword search
-        - get_docs(["lora"], module="oumi.core.configs") -> Filtered search
-        - get_docs(["infer"], kind="function") -> Kind-filtered search
+        query: Exact names or keywords, e.g. ["TrainingConfig"] or
+            ["learning_rate", "lora"].
+        module: Module prefix filter (e.g. "oumi.core.configs").
+        kind: Kind filter: "class", "dataclass", "function", or "method".
+        limit: Max results (default 10).
+        summarize: Compact output omitting fields and docstring sections.
     """
     return search_docs(
         query=query, module=module, kind=kind, limit=limit, summarize=summarize
@@ -2493,28 +2728,7 @@ def get_docs(
 
 @mcp.tool()
 def list_modules() -> ListModulesResponse:
-    """List modules currently indexed for ``get_docs`` tool discovery.
-
-    This is the entry point for documentation discovery. It returns the module
-    namespaces available to ``get_docs`` plus light inventory metadata so
-    agents can choose a narrow search scope.
-
-    Recommended usage:
-    1. Call ``list_modules()`` once to discover candidate namespaces.
-    2. Select one module prefix (for example ``oumi.core.configs``).
-    3. Call ``get_docs(query, module=<prefix>)`` for precise retrieval.
-    4. If no results, broaden to fewer filters or a higher-level module prefix.
-
-    Returns:
-        ListModulesResponse with:
-        - modules: Per-module summaries (module path, description, counts).
-        - total_entries: Total number of indexed documentation entries.
-        - index_ready: Whether background indexing has completed.
-
-    Examples:
-        - list_modules() -> See all indexed modules with class counts
-        - Then use get_docs(["TrainingConfig"]) to look up specific classes
-    """
+    """List indexed API modules available for ``get_docs`` searches."""
     return get_module_list()
 
 
@@ -2675,28 +2889,11 @@ def get_configs_source() -> str:
 def config_sync(force: bool = False) -> dict:
     """Sync configs from the Oumi repository, matching the installed version.
 
-    For release builds (e.g. oumi 0.7), downloads configs from the ``v0.7``
-    Git tag so they stay compatible with the installed library.  For dev
-    builds (e.g. ``0.8.dev35+g...``), downloads from the ``main`` branch.
-    Falls back to ``main`` when the tag archive returns a 404.
-
-    The sync process:
-    1. Check if cache is stale (skip download if fresh, unless force=True)
-    2. Resolve the correct Git tag (or main) for the installed oumi version
-    3. Download the archive and extract only the configs/ directory
-    4. Write timestamp and version markers for staleness tracking
-    5. Clean up temporary files
+    Release builds download from the matching Git tag; dev builds use main.
+    Skips download if cache is fresh (unless force=True).
 
     Args:
-        force: If True, sync regardless of cache age.
-
-    Returns:
-        Dict with:
-        - ok: True if sync succeeded or cache is fresh
-        - skipped: True if sync was skipped (cache is fresh)
-        - error: Error message if sync failed, None otherwise
-        - configs_synced: Number of config files synced (0 if skipped)
-        - source: Description of where configs came from
+        force: Sync regardless of cache age.
     """
     if not force and not _is_cache_stale():
         logger.info("Config cache is fresh, skipping sync")
@@ -2850,6 +3047,7 @@ def main() -> None:
     3. Starts the MCP server.
     """
     _configure_logging()
+    _strip_oumi_env_overrides()
     logger.info("Starting Oumi Config MCP Server")
 
     sync_result = config_sync()

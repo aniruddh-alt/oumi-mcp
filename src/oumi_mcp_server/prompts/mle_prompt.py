@@ -17,8 +17,9 @@ MCP tools, customize configs, validate, and evaluate before iterating.
 - Tool-first: Use MCP tools to find and adapt existing configs rather than building from scratch
 
 ## When to use each tool
-1. search_configs: First step for finding training recipes
-2. get_config: Retrieve full YAML after finding candidates
+0. get_started: ALWAYS call this FIRST — returns the full tool catalog, path rules, and workflow
+1. search_configs: Find training recipes by model, task, or keyword
+2. get_config: Study a reference config for structure and defaults — do NOT copy verbatim
 3. validate_config: ALWAYS validate before training
 4. launch_training: Execute after validation passes (if available)
 
@@ -35,7 +36,7 @@ MCP tools, customize configs, validate, and evaluate before iterating.
 - list_categories(): Discover available model families and config categories
 - search_configs(query, task, model, limit): Find training/eval/inference recipes
 - get_config(path, include_content): Retrieve YAML and metadata for a recipe
-- validate_config(config, task_type): Validate before running
+- validate_config(config, task_type, client_cwd): Validate before running
 
 ## Workflow
 ### Phase 1: Requirements Gathering
@@ -58,6 +59,9 @@ Task mapping (examples):
 PEFT selection:
 - Use LoRA/QLoRA when GPU memory is limited or rapid iteration is needed
 - Use full fine-tuning when maximum quality and compute are available
+- CRITICAL: When using LoRA/QLoRA, you MUST set `training.use_peft: True` in
+  addition to providing the `peft:` config block. Without `use_peft: True`,
+  the peft block is silently ignored and full fine-tuning runs instead — causing OOM.
 
 ### Phase 3: Data Validation
 - Consistent schema across examples
@@ -75,18 +79,27 @@ Red flags (fix before training):
 - More than 10% low-quality examples
 
 ### Phase 4: Config Customization
-1. get_config("path", include_content=True)
-2. Adapt key settings
-3. Save modified config
-4. validate_config("/path/to/config.yaml", "training")
+1. get_config("path", include_content=True) — use as a REFERENCE only, not a template to copy
+2. Build a new config from scratch, adapting only the relevant settings for the user's
+   specific model, dataset, hardware, and goals
+3. Save the new config
+4. validate_config("config.yaml", "training", client_cwd="/path/to/project")
 
 Key settings to customize:
 - model.model_name
-- data.train.datasets
+- data.train.datasets (see dataset_name reference below)
 - training.output_dir
 - training.learning_rate
 - training.per_device_train_batch_size
 - training.gradient_accumulation_steps
+- training.use_peft: True (REQUIRED when using LoRA/QLoRA — peft block alone is NOT enough)
+
+dataset_name reference — use these EXACT registry names (NOT Python class names):
+- `text_sft_jsonl` — Local JSONL file with SFT conversations (most common for custom data)
+  Requires: `dataset_path: "path/to/train.jsonl"` pointing to the JSONL file
+- For HuggingFace datasets: use the full HF ID as dataset_name (e.g. `yahma/alpaca-cleaned`)
+- WRONG: `TextSftJsonLinesDataset`, `TextSftJsonlDataset` — these are class names, not registry names
+- Use `get_docs(["dataset"])` to search for other registered dataset names
 
 ### Phase 5: Evaluation Strategy
 - During training: monitor train/val loss
@@ -164,12 +177,13 @@ TRAIN_COMMAND_RESOURCE = """<resource>
 
 <key_config>
 <field name="model.model_name">HF model ID or local path.</field>
-<field name="data.train.datasets">Dataset list; include dataset_name/path and splits.</field>
+<field name="data.train.datasets">Dataset list. Use registry names for dataset_name (e.g. "text_sft_jsonl" for local JSONL, or a HuggingFace ID). NOT Python class names.</field>
 <field name="training.learning_rate">Start from recipe; tune if unstable or slow.</field>
 <field name="training.max_steps">Limit steps for quick iteration.</field>
 <field name="training.output_dir">Per-run output directory for checkpoints/logs.</field>
 <field name="training.per_device_train_batch_size">Tune to avoid OOM.</field>
 <field name="training.gradient_accumulation_steps">Increase if batch size is small.</field>
+<field name="training.use_peft">MUST be True when using LoRA/QLoRA. Without this, the peft block is silently ignored and full fine-tuning runs — causing OOM on smaller GPUs.</field>
 </key_config>
 
 <common_overrides>
@@ -318,6 +332,345 @@ EVAL_COMMAND_RESOURCE = """<resource>
 <item>Metrics and run metadata in `output_dir` (e.g., task_result.json).</item>
 </outputs>
 </resource>
+"""
+
+CLOUD_LAUNCH_RESOURCE = """# Cloud Job Launch Guide
+
+## Why You Need a Job Config for Cloud Runs
+
+Cloud jobs run on remote VMs managed by SkyPilot. Unlike local runs where `oumi train -c config.yaml`
+is enough, cloud runs need additional information:
+- **setup**: How to install Oumi and dependencies on the fresh VM
+- **run**: The exact shell command to execute
+- **working_dir**: Which local files to sync to the remote VM
+- **file_mounts**: Credential files (HF token, .netrc) to copy
+- **storage_mounts**: Persistent cloud storage for outputs (important for spot instances)
+- **envs**: Environment variables (API keys, project names)
+- **resources**: Cloud provider, GPU type, disk size, spot/on-demand
+
+## How Path Resolution Works
+
+When you call `run_oumi_job(config_path, command, client_cwd)`:
+
+1. **`client_cwd`** = absolute path to the user's project root (e.g. `/home/user/my-project`)
+2. **`config_path`** is resolved relative to `client_cwd` (e.g. `configs/train.yaml` → `/home/user/my-project/configs/train.yaml`)
+3. For cloud jobs, `client_cwd` becomes the **`working_dir`** in the job config
+4. SkyPilot rsyncs `working_dir` to `~/sky_workdir` on the remote VM
+5. The `run` command `cd`s into `~/sky_workdir`, so **repo-relative paths** resolve correctly
+6. Only **git-tracked files** are synced (when `.gitignore` is present); untracked files are silently skipped
+
+**Always pass `client_cwd`** — without it, the MCP server's own working directory is used (which is NOT your project root), and files won't be found.
+
+## GPU Sizing for Cloud Jobs
+
+| Model Size | Full Fine-Tune | LoRA | QLoRA | Recommended GPU |
+|-----------|---------------|------|-------|----------------|
+| 3B | 24 GB | 12 GB | 8 GB | A10G (22 GB) or L4 (24 GB) |
+| 7-8B | 60 GB | 20 GB | 14 GB | LoRA: A10G; FFT: A100 (40 GB) |
+| 13B | 100 GB | 32 GB | 20 GB | LoRA: A100 (40 GB); FFT: A100:2+ |
+| 70B | 400 GB+ | 80 GB | 48 GB | A100:8 or H100:4+ |
+
+**CRITICAL: LoRA requires `training.use_peft: True`** in your training config.
+The `peft:` config block alone is NOT enough — without `use_peft: True`, Oumi silently
+runs full fine-tuning, which uses ~4x more VRAM and will OOM on smaller GPUs.
+
+## Key Fields
+
+### `setup` (shell script)
+Runs once when the VM is provisioned. Install Oumi, download datasets, install extras:
+```bash
+set -e
+pip install uv && uv pip install --system 'oumi[gpu]'
+# Download datasets
+huggingface-cli download <dataset-id> --repo-type dataset --local-dir ./data
+# Install additional packages
+uv pip install --system flash-attn
+```
+
+### `run` (shell script)
+The training command. For multi-GPU, use `oumi distributed torchrun`:
+```bash
+set -e
+oumi train -c ./config.yaml
+# Multi-GPU:
+# oumi distributed torchrun -m oumi train -c ./config.yaml
+```
+
+### `working_dir`
+Local directory synced to the remote VM via rsync. **Use `working_dir: .`** (the
+default) — `client_cwd` resolves it to the user's project root at launch time.
+Do NOT embed absolute local paths like `/Users/you/project` — they make the
+config non-portable and may not exist on another machine.
+
+The training config file is placed inside this directory on the VM at
+`~/sky_workdir/`.
+
+**Important:** Only git-tracked files are synced when a `.gitignore` is present.
+If a file isn't in git, SkyPilot will silently skip it. Use `file_mounts` for
+untracked files (see below).
+
+### Path conventions for cloud jobs
+
+Use **repo-relative paths** for project files (data, configs, output). These
+resolve from `working_dir` on the remote VM after sync.
+
+| Path type | Convention | Example |
+|-----------|-----------|---------|
+| Project files (data, configs) | Repo-relative | `data/pubmed_qa/train.jsonl` |
+| Config references | Repo-relative | `configs/train.yaml` |
+| Training output | Repo-relative | `output/...` |
+| Remote-only output | Remote absolute | `/home/ubuntu/output/...` |
+| Local machine paths | **NEVER** | ~~`/Users/you/project/data/...`~~ |
+
+**NEVER** use local machine paths like `/Users/.../` or `/home/yourname/...`
+in cloud configs — they don't exist on the remote VM. The pre-flight check
+will block these automatically.
+
+### How dataset files reach the remote VM
+
+There are 3 ways a dataset file can be available on the VM:
+
+1. **`working_dir` sync** — Files inside `working_dir` that are **git-tracked** are
+   automatically rsynced to `~/sky_workdir` on the VM. Reference them as repo-relative
+   paths (e.g. `./data/train.jsonl`). Untracked files are silently skipped.
+
+2. **`file_mounts`** — Explicitly copy local files to the VM. Use this for datasets
+   that are NOT git-tracked or are outside your project directory:
+   ```yaml
+   file_mounts:
+     ~/sky_workdir/data/train.jsonl: /Users/you/datasets/train.jsonl
+   ```
+   Then reference as `./data/train.jsonl` in your training config.
+
+3. **`setup` script download** — Download from HuggingFace or cloud storage during VM setup:
+   ```bash
+   huggingface-cli download my-org/my-dataset --repo-type dataset --local-dir ./data
+   ```
+
+### `storage_mounts`
+Mount cloud storage buckets for persistent output. Critical for spot instances
+where the VM can be preempted:
+```yaml
+storage_mounts:
+  /output:
+    source: gs://your-bucket/training-output
+    store: gcs
+```
+
+### `file_mounts`
+Copy local files to the remote VM. Credential files (HF token, .netrc) are
+auto-detected and mounted automatically.
+
+Use `file_mounts` for **local dataset files** that are either:
+- Outside your `working_dir`, OR
+- Not git-tracked (SkyPilot skips untracked files during working_dir sync)
+
+```yaml
+file_mounts:
+  # Credentials (auto-detected, but can override)
+  ~/.cache/huggingface/token: ~/.cache/huggingface/token
+  ~/.netrc: ~/.netrc
+  # Local datasets → remote VM paths
+  ~/sky_workdir/data/train.jsonl: /Users/you/datasets/train.jsonl
+  ~/sky_workdir/data/val.jsonl: /Users/you/datasets/val.jsonl
+```
+
+Then reference the data in your training config as `./data/train.jsonl`
+(relative to `working_dir` = `~/sky_workdir`).
+
+### `envs`
+Environment variables set on the remote VM. Local env vars are NOT forwarded:
+```yaml
+envs:
+  WANDB_API_KEY: "your-key"
+  WANDB_PROJECT: "my-project"
+  HF_TOKEN: "hf_..."
+```
+
+## Example Complete Job Config
+
+```yaml
+name: train-llama3-sft
+resources:
+  cloud: gcp
+  accelerators: "A100:8"
+  use_spot: false
+  disk_size: 500
+num_nodes: 1
+working_dir: .  # Resolved to client_cwd at launch time
+
+file_mounts:
+  ~/.cache/huggingface/token: ~/.cache/huggingface/token
+  ~/.netrc: ~/.netrc
+
+storage_mounts:
+  /output:
+    source: gs://my-bucket/training-output
+    store: gcs
+
+envs:
+  WANDB_API_KEY: "..."
+  WANDB_PROJECT: "llama3-sft"
+
+setup: |
+  set -e
+  pip install uv && uv pip install --system 'oumi[gpu]'
+  huggingface-cli download my-org/my-dataset --repo-type dataset --local-dir ./data
+
+run: |
+  set -e
+  oumi train -c ./config.yaml
+```
+
+## How `run_oumi_job` Works
+
+### With a training config (e.g., train.yaml with `model`, `training` keys):
+1. **Dry-run** (`dry_run=True`): Returns a complete job config YAML template with
+   TODO markers for sections you need to customize. Save it, edit it, re-submit.
+2. **With overrides**: Pass `setup_script` and `run_script` to override the defaults
+   inline without creating a separate file.
+3. **Execute**: Set `dry_run=False, confirm=True, user_confirmation="EXECUTE"`.
+
+### With a job config (has `resources`, `setup`, `run` keys):
+- Passed directly to `oumi launch up` — all fields preserved as written.
+- `setup_script`/`run_script` overrides are ignored (the config has its own).
+
+## Common Setup Patterns
+
+### Fine-tuning a gated model (Llama, Gemma):
+```bash
+set -e
+pip install uv && uv pip install --system 'oumi[gpu]'
+huggingface-cli whoami  # verify HF auth works
+```
+
+### Training with custom dataset from HuggingFace:
+```bash
+set -e
+pip install uv && uv pip install --system 'oumi[gpu]'
+huggingface-cli download my-org/my-dataset --repo-type dataset --local-dir ./data
+```
+
+### Training with evaluation:
+```bash
+set -e
+pip install uv && uv pip install --system 'oumi[gpu,evaluation]'
+```
+
+## Troubleshooting: File Not Found on VM
+
+| Cause | Symptom | Fix |
+|-------|---------|-----|
+| `working_dir` pointed to wrong directory (no `client_cwd`) | `FileNotFoundError: configs/train.yaml` | Always pass `client_cwd` to `run_oumi_job` |
+| File not git-tracked | File exists locally but missing on VM | `git add <file>` and commit, or use `file_mounts` |
+| Local absolute path in cloud config | `/Users/you/data/...` doesn't exist on VM | Use repo-relative paths (e.g. `data/...`) |
+| File outside `working_dir` | Only `working_dir` contents are synced | Use `file_mounts` to copy files from other locations |
+
+**Diagnosis steps:**
+1. Check the dry-run output — it shows the resolved `working_dir` and generated job config
+2. Run `git status` in your project — untracked files won't sync
+3. Verify paths in your training config are repo-relative, not absolute local paths
+"""
+
+POST_TRAINING_RESOURCE = """# Post-Training Guide — What To Do After Cloud Training Succeeds
+
+## Priority Order
+
+When training completes on a cloud VM, act quickly — the cluster is billing you.
+
+1. **Download model weights** (do this first)
+2. **Run evaluation on the cluster** (optional, while cluster is still up)
+3. **Tear down the cluster**
+4. **Merge LoRA adapter locally** (if applicable)
+5. **Push to HuggingFace Hub** (optional)
+
+---
+
+## Step 1: Download Model Weights
+
+The MCP has no file-transfer tool. Use SkyPilot CLI directly in the user's terminal:
+
+```bash
+# Download the output directory from the remote VM
+sky rsync-down <cluster-name> ~/sky_workdir/<output_dir> ./output/
+
+# Example:
+sky rsync-down sky-abc-user ~/sky_workdir/output/llama8b-sft ./output/
+```
+
+**LoRA adapters are small** (~5-50 MB depending on rank and target modules).
+Full fine-tuned models are the size of the base model (e.g. ~16 GB for 8B in bf16).
+
+The output directory typically contains:
+- `adapter_model.safetensors` + `adapter_config.json` (LoRA)
+- OR `model-*.safetensors` + config files (full fine-tune)
+- `trainer_state.json`, `training_args.bin` (training metadata)
+
+## Step 2: Run Evaluation (Optional, On-Cluster)
+
+While the cluster is still running, evaluate the fine-tuned model to get benchmark
+scores. Use `run_oumi_job` with `command: "evaluate"`:
+
+- Point `model.model_name` at the output path on the remote VM
+- Use the same cluster (it already has the model weights)
+- Common benchmarks: MMLU, HellaSwag, ARC, or task-specific evals
+
+This avoids downloading the full model just to evaluate it.
+
+## Step 3: Tear Down the Cluster
+
+Once weights are downloaded, stop billing immediately:
+
+| Action | MCP Tool | SkyPilot CLI | Effect |
+|--------|----------|-------------|--------|
+| **Stop** (pause) | `stop_cluster(cluster)` | `sky stop <cluster>` | Stops compute billing, keeps disk. Can restart later. |
+| **Down** (delete) | `down_cluster(cluster)` | `sky down <cluster>` | Deletes everything — VM, disk, all files. Irreversible. |
+
+**Use `stop`** if you might want to run more jobs on the same cluster.
+**Use `down`** if you're done — this is cheaper (no disk storage fees).
+
+## Step 4: Merge LoRA Adapter (Local)
+
+If you trained with LoRA/QLoRA, merge the adapter into the base model for easier deployment:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+base = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
+model = PeftModel.from_pretrained(base, "./output/llama8b-sft")
+merged = model.merge_and_unload()
+merged.save_pretrained("./output/llama8b-sft-merged")
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+tokenizer.save_pretrained("./output/llama8b-sft-merged")
+```
+
+Or use Oumi CLI:
+```bash
+oumi merge -c merge_config.yaml
+```
+
+## Step 5: Push to HuggingFace Hub (Optional)
+
+```bash
+huggingface-cli upload <your-org>/<model-name> ./output/llama8b-sft-merged
+# Or just the adapter:
+huggingface-cli upload <your-org>/<model-name>-lora ./output/llama8b-sft
+```
+
+## Quick Reference: What the MCP Can and Cannot Do Post-Training
+
+| Task | MCP Support | How |
+|------|------------|-----|
+| Check job status | Yes | `get_job_status(job_id)` |
+| View training logs | Yes | `get_job_logs(job_id)` |
+| Run evaluation | Yes | `run_oumi_job(command="evaluate", ...)` |
+| Run inference | Yes | `run_oumi_job(command="infer", ...)` |
+| Stop/delete cluster | Yes | `stop_cluster()` / `down_cluster()` |
+| Download files | No | Use `sky rsync-down` in terminal |
+| Merge LoRA adapter | No | Use `peft` or `oumi merge` locally |
+| Push to HF Hub | No | Use `huggingface-cli upload` in terminal |
 """
 
 INFER_COMMAND_RESOURCE = """<resource>
