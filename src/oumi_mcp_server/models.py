@@ -1,6 +1,6 @@
 """TypedDict models for Oumi MCP server data structures."""
 
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from oumi_mcp_server.constants import TaskType
 
@@ -71,27 +71,20 @@ class CategoriesResponse(TypedDict):
         model_families: Available model families in recipes/.
         api_providers: Available API providers in apis/.
         total_configs: Total number of configs available.
+        oumi_version: Installed oumi library version.
+        configs_source: Where configs are loaded from (e.g. "cache:0.7",
+            "cache:main", "bundled:0.7", "env:/path").
+        version_warning: Non-empty when configs may be mismatched with the
+            installed library version.
     """
 
     categories: list[str]
     model_families: list[str]
     api_providers: list[str]
     total_configs: int
-
-
-class SearchResult(TypedDict):
-    """Result item from search_configs tool.
-
-    This is an alias for ConfigMetadata for clarity in tool responses.
-    """
-
-    path: str
-    description: str
-    model_name: str
-    task_type: TaskType
-    datasets: list[str]
-    reward_functions: list[str]
-    peft_type: str  # "lora", "qlora", or "" for full fine-tuning
+    oumi_version: str
+    configs_source: str
+    version_warning: str
 
 
 class HardwareInfo(TypedDict):
@@ -149,7 +142,17 @@ class PreFlightCheckResponse(TypedDict):
         cloud_readiness: SkyPilot cloud credential status.
         errors: Issues that will cause the training run to crash.
         warnings: Potential issues that may be fine if targeting a remote cluster.
-        paths: Local filesystem paths from the config mapped to whether they exist.
+        paths: Config paths mapped to validation status: "ok", "not_found",
+            "ok_remote", "not_found_warning", or "local_machine_path_error".
+        dataset_checks: Per-dataset validation results (e.g. "ok", "not_found",
+            "warning_timeout"). Only present when datasets are found in config.
+        suggested_configs: Relative config paths relevant to the model in this config.
+            Only present when ``cloud`` was specified. Pass these to ``get_config()``
+            to retrieve full YAML examples for reference or adaptation.
+        cloud_file_checks: Per-path cloud file delivery validation. Keys are
+            paths from the config, values are statuses: "ok", "missing_local_source",
+            "not_reachable_on_vm", "unverifiable_remote", "working_dir_suspicious".
+            Only present for cloud jobs.
     """
 
     blocking: bool
@@ -160,7 +163,10 @@ class PreFlightCheckResponse(TypedDict):
     cloud_readiness: CloudReadiness
     errors: list[str]
     warnings: list[str]
-    paths: dict[str, bool]
+    paths: dict[str, str]
+    dataset_checks: NotRequired[dict[str, str]]
+    suggested_configs: NotRequired[list[str]]
+    cloud_file_checks: NotRequired[dict[str, str]]
 
 
 class JobSubmissionResponse(TypedDict):
@@ -178,7 +184,6 @@ class JobSubmissionResponse(TypedDict):
         cloud: Cloud provider (e.g. "local", "gcp", "aws").
         cluster_name: Cluster name (empty if auto-generated).
         model_name: HuggingFace model ID extracted from config.
-        output_dir: Output directory extracted from config.
         message: Human-readable summary of what happened or will happen.
         error: Error message if success is False.
         launch_confirmed: True if the launch was confirmed (cloud only).
@@ -199,7 +204,6 @@ class JobSubmissionResponse(TypedDict):
     cloud: str
     cluster_name: str
     model_name: str
-    output_dir: str
     message: str
     error: NotRequired[str]
     launch_confirmed: NotRequired[bool]
@@ -242,7 +246,7 @@ class JobStatusResponse(TypedDict):
     cluster: str
     model_name: str
     is_done: bool
-    metadata: NotRequired[str]
+    metadata: NotRequired[dict[str, Any]]
     log_file: NotRequired[str]
     error: str | None
 
@@ -367,6 +371,7 @@ class DocsSearchResponse(TypedDict):
         query: The normalized query terms used for this search.
         total_matches: Total number of matches before limiting.
         index_ready: Whether background indexing has completed.
+        oumi_version: Version of the installed oumi library the docs reflect.
         error: Error message, or "" if no error.
     """
 
@@ -374,6 +379,7 @@ class DocsSearchResponse(TypedDict):
     query: list[str]
     total_matches: int
     index_ready: bool
+    oumi_version: str
     error: str
 
 
@@ -402,8 +408,52 @@ class ListModulesResponse(TypedDict):
         modules: Per-module summaries.
         total_entries: Total number of indexed documentation entries.
         index_ready: Whether background indexing has completed.
+        oumi_version: Version of the installed oumi library the docs reflect.
     """
 
     modules: list[ModuleInfo]
     total_entries: int
     index_ready: bool
+    oumi_version: str
+
+
+class ValidateConfigResponse(TypedDict):
+    """Response from validate_config tool.
+
+    Attributes:
+        ok: True if the config is valid against its schema.
+        error: Validation error message, or None if valid.
+    """
+
+    ok: bool
+    error: str | None
+
+
+class ClusterLifecycleResponse(TypedDict):
+    """Response from stop_cluster and down_cluster tools.
+
+    Attributes:
+        success: Whether the operation succeeded.
+        message: Human-readable result description.
+        error: Error message if the operation failed.
+    """
+
+    success: bool
+    message: NotRequired[str]
+    error: NotRequired[str]
+
+
+class CloudJobConfigTemplateResponse(TypedDict):
+    """Response from get_cloud_job_config_template tool.
+
+    Attributes:
+        cloud: Normalized cloud provider name.
+        template_yaml: Complete job config YAML string, ready to customize and save.
+        key_fields: List of fields the agent must customize before using.
+        notes: Cloud-specific notes and tips.
+    """
+
+    cloud: str
+    template_yaml: str
+    key_fields: list[str]
+    notes: str

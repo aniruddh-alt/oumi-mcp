@@ -16,14 +16,18 @@ Design:
 """
 
 import asyncio
+import dataclasses
 import io
+import json
 import logging
 import os
+import shlex
+import shutil
 import subprocess
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,9 +37,8 @@ from oumi.core.launcher.base_cluster import JobStatus as OumiJobStatus
 
 from oumi_mcp_server.config_service import parse_yaml
 from oumi_mcp_server.constants import (
-    JOB_LOGS_DIR,
+    DEFAULT_JOBS_FILE,
     LOG_TAIL_INTERVAL_SECONDS,
-    MAX_COMPLETED_JOBS,
 )
 from oumi_mcp_server.models import JobCancelResponse
 
@@ -44,118 +47,203 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class JobRecord:
-    """Tracks a single Oumi job submitted via the MCP server.
+    """Persisted job metadata — identity mapping only.
 
-    Attributes:
-        job_id: MCP-generated unique identifier.
-        command: Oumi CLI subcommand (train, evaluate, etc.).
-        config_path: Absolute path to the YAML config.
-        cloud: Cloud provider name (e.g. "local", "gcp", "aws").
-        cluster_name: Cluster name used with the launcher.
-        oumi_job_id: The job ID returned by ``oumi.launcher`` (on the cluster).
-        model_name: Model name extracted from config for display.
-        output_dir: Output directory extracted from config for display.
-        log_dir: Directory where stdout/stderr log files are written.
-        process: The ``subprocess.Popen`` handle for local jobs.
-        cluster_obj: The ``BaseCluster`` returned by ``launcher.up()``
-            (cloud jobs only).
-        submit_time: UTC timestamp when the job was submitted.
-        oumi_status: Latest ``JobStatus`` snapshot from the launcher
-            (cloud jobs only).
-        error_message: Error string if submission itself failed.
-        runner_task: The background asyncio task running the job.
+    All fields are strings for simple JSON serde.
+    The registry does NOT store job status; status is always
+    queried live from ``oumi.launcher.status()`` (cloud) or
+    ``rt.process.poll()`` (local).
     """
 
     job_id: str
     command: str
     config_path: str
-    cloud: str = "local"
-    cluster_name: str = ""
-    oumi_job_id: str = ""
-    model_name: str = ""
+    cloud: str
+    cluster_name: str
+    oumi_job_id: str
+    model_name: str
+    submit_time: str  # ISO 8601
     output_dir: str = ""
-    log_dir: Path = field(default_factory=lambda: JOB_LOGS_DIR)
-    process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
-    cluster_obj: BaseCluster | None = field(default=None, repr=False)
-    submit_time: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    oumi_status: OumiJobStatus | None = field(default=None, repr=False)
+
+
+@dataclass
+class JobRuntime:
+    """Ephemeral per-job state -- lives only in memory, never persisted."""
+
+    process: subprocess.Popen | None = None  # type: ignore[type-arg]
+    cluster_obj: BaseCluster | None = None
+    runner_task: asyncio.Task[None] | None = None
+    oumi_status: OumiJobStatus | None = None
+    stdout_f: Any = None
+    stderr_f: Any = None
+    log_dir: Path | None = None
+    run_dir: Path | None = None
+    staged_config_path: str = ""
+    cancel_requested: bool = False
     error_message: str | None = None
-    runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
-    def __post_init__(self) -> None:
-        """Set log_dir to a per-job subdirectory under JOB_LOGS_DIR."""
-        self.log_dir = JOB_LOGS_DIR / self.job_id
+    def close_log_files(self) -> None:
+        for f in (self.stdout_f, self.stderr_f):
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+        self.stdout_f = None
+        self.stderr_f = None
 
-    @property
-    def is_local(self) -> bool:
-        """True if this is a local job (not cloud)."""
-        return self.cloud == "local"
 
-    @property
-    def is_done(self) -> bool:
-        """True if the job has finished (locally or on a cloud cluster)."""
-        if self.process is not None:
-            return self.process.poll() is not None
-        if self.oumi_status is not None:
-            return self.oumi_status.done
-        return self.error_message is not None
+_MAX_REGISTRY_AGE_DAYS = 7
+_MAX_REGISTRY_SIZE = 200
+_CLOUD_LOG_TIMEOUT = 30.0
 
 
 class JobRegistry:
-    """Async-safe in-memory registry of ``JobRecord`` instances.
+    """Single-file JSON registry mapping MCP job IDs to cloud identities.
 
-    Evicts the oldest finished jobs when the count exceeds
-    ``MAX_COMPLETED_JOBS``.
+    Evicts entries older than ``_MAX_REGISTRY_AGE_DAYS`` on load.
+    Caps total records at ``_MAX_REGISTRY_SIZE``, dropping oldest first.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path) -> None:
+        self._path = path
         self._jobs: dict[str, JobRecord] = {}
-        self._lock = asyncio.Lock()
+        self._load()
 
-    async def register(self, record: JobRecord) -> None:
-        async with self._lock:
-            if record.job_id in self._jobs:
-                raise ValueError(f"Job ID already exists: {record.job_id}")
-            self._jobs[record.job_id] = record
-            self._evict_finished_unlocked()
-
-    def _evict_finished_unlocked(self) -> None:
-        finished = [r for r in self._jobs.values() if r.is_done]
-        if len(finished) <= MAX_COMPLETED_JOBS:
+    def _load(self) -> None:
+        if not self._path.exists():
             return
-        finished.sort(key=lambda r: r.submit_time)
-        for r in finished[: len(finished) - MAX_COMPLETED_JOBS]:
-            del self._jobs[r.job_id]
-            logger.debug("Evicted finished job %s from registry", r.job_id)
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            for entry in data:
+                # Handle legacy records that still have 'status' field
+                entry.pop("status", None)
+                r = JobRecord(**entry)
+                self._jobs[r.job_id] = r
+        except Exception:
+            logger.warning("Could not load %s, starting fresh", self._path)
+        pruned = self._prune()
+        if pruned:
+            logger.info("Pruned %d stale job records from registry", pruned)
+            self._save()
 
-    async def get(self, job_id: str) -> JobRecord | None:
-        async with self._lock:
-            return self._jobs.get(job_id)
+    def _prune(self) -> int:
+        """Remove entries older than the age cutoff, then cap total size."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=_MAX_REGISTRY_AGE_DAYS)
+        to_remove: list[str] = []
+        for jid, rec in self._jobs.items():
+            try:
+                ts = datetime.fromisoformat(rec.submit_time)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts < cutoff:
+                    to_remove.append(jid)
+            except (ValueError, TypeError):
+                to_remove.append(jid)
+        for jid in to_remove:
+            del self._jobs[jid]
+        removed = len(to_remove)
 
-    async def all_jobs(self) -> list[JobRecord]:
-        async with self._lock:
-            return list(self._jobs.values())
+        # Cap total size — drop oldest first
+        if len(self._jobs) > _MAX_REGISTRY_SIZE:
+            by_time = sorted(self._jobs.items(), key=lambda x: x[1].submit_time)
+            while len(self._jobs) > _MAX_REGISTRY_SIZE and by_time:
+                jid, _ = by_time.pop(0)
+                del self._jobs[jid]
+                removed += 1
 
-    async def running(self) -> list[JobRecord]:
-        async with self._lock:
-            return [r for r in self._jobs.values() if not r.is_done]
+        return removed
 
-    async def completed(self) -> list[JobRecord]:
-        async with self._lock:
-            return [r for r in self._jobs.values() if r.is_done]
+    def _save(self) -> None:
+        records = [dataclasses.asdict(r) for r in self._jobs.values()]
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        tmp.rename(self._path)
+
+    def add(self, record: JobRecord) -> None:
+        self._jobs[record.job_id] = record
+        self._save()
+
+    def update(self, job_id: str, **fields: Any) -> None:
+        record = self._jobs.get(job_id)
+        if record is None:
+            logger.warning("Registry.update: job_id %s not found, skipping", job_id)
+            return
+        for k, v in fields.items():
+            setattr(record, k, v)
+        self._save()
+
+    def get(self, job_id: str) -> JobRecord | None:
+        return self._jobs.get(job_id)
+
+    def find_by_cloud_identity(self, cloud: str, oumi_job_id: str) -> JobRecord | None:
+        for r in self._jobs.values():
+            if r.cloud == cloud and r.oumi_job_id == oumi_job_id:
+                return r
+        return None
+
+    def all(self) -> list[JobRecord]:
+        return list(self._jobs.values())
+
+    def remove(self, job_id: str) -> None:
+        self._jobs.pop(job_id, None)
+        self._save()
 
 
-registry = JobRegistry()
+_runtimes: dict[str, JobRuntime] = {}
+
+
+def get_runtime(job_id: str) -> JobRuntime:
+    if job_id not in _runtimes:
+        _runtimes[job_id] = JobRuntime()
+    return _runtimes[job_id]
+
+
+def evict_runtime(job_id: str) -> None:
+    """Remove a runtime entry, closing any open handles."""
+    rt = _runtimes.pop(job_id, None)
+    if rt is None:
+        return
+    rt.close_log_files()
+    if rt.runner_task and not rt.runner_task.done():
+        rt.runner_task.cancel()
+
+
+def cleanup_stale_runtimes() -> None:
+    """Remove runtime entries whose job_id is no longer in the registry."""
+    reg = get_registry()
+    stale = [jid for jid in _runtimes if reg.get(jid) is None]
+    for jid in stale:
+        evict_runtime(jid)
+    if stale:
+        logger.info("Evicted %d stale runtime entries", len(stale))
+
+
+_registry: JobRegistry | None = None
+
+
+def get_registry(path: Path | None = None) -> JobRegistry:
+    """Return the global ``JobRegistry``, creating it on first access."""
+    global _registry
+    if _registry is None:
+        _registry = JobRegistry(path or DEFAULT_JOBS_FILE)
+    return _registry
 
 
 def make_job_id(command: str, job_name: str | None = None) -> str:
     """Generate a human-friendly job ID.
 
     Format: ``{command}_{YYYYMMDD_HHMMSS}_{6-hex}`` or the caller-supplied
-    *job_name* if provided.
+    *job_name* if provided (sanitized to prevent path traversal).
     """
     if job_name:
-        return job_name
+        sanitized = job_name.replace("..", "_").replace("/", "_").replace("\\", "_")
+        sanitized = sanitized.strip("._- ")
+        if not sanitized:
+            raise ValueError(f"Invalid job_name after sanitization: {job_name!r}")
+        return sanitized
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:6]
     return f"{command}_{ts}_{short}"
@@ -189,11 +277,126 @@ _COMMAND_MAP: dict[str, str] = {
     "quantize": "oumi quantize",
 }
 
+_DEFAULT_CLOUD_SETUP_SCRIPT = """set -e
+pip install uv
+uv pip install --system oumi[gpu]
+command -v oumi || { echo "ERROR: oumi not found after install"; exit 1; }
+"""
 
-def _build_shell_command(config_path: str, command: str) -> str:
-    """Build the shell command string for an Oumi CLI invocation."""
+_DEFAULT_CREDENTIAL_FILES: list[str] = [
+    "~/.cache/huggingface/token",
+    "~/.netrc",
+]
+
+
+def _is_job_config(config_path: Path) -> bool:
+    """Return True if *config_path* is a launcher job config (not a training config).
+
+    A job config has top-level ``resources``, ``setup``, or ``run`` keys rather
+    than training-specific keys like ``model`` or ``training``.
+    """
+    try:
+        data = parse_yaml(str(config_path))
+        if not isinstance(data, dict):
+            return False
+        job_config_keys = {"resources", "setup", "run"}
+        return bool(job_config_keys.intersection(data.keys()))
+    except Exception:
+        return False
+
+
+def _parse_gpu_count(accelerators: str | None) -> int:
+    """Parse the number of GPUs from an accelerator spec string.
+
+    Handles formats like ``"A100:8"`` (→ 8), ``"A100"`` (→ 1),
+    and ``None`` (→ 0).
+    """
+    if not accelerators:
+        return 0
+    parts = accelerators.split(":")
+    if len(parts) >= 2:
+        try:
+            return int(parts[-1])
+        except ValueError:
+            pass
+    return 1
+
+
+def _default_file_mounts() -> dict[str, str]:
+    """Return file mounts for common credential files that exist locally.
+
+    Includes ``~/.cache/huggingface/token`` (HuggingFace auth) and
+    ``~/.netrc`` (WandB / general HTTP credentials) when they exist.
+    """
+    mounts: dict[str, str] = {}
+    for cred_path in _DEFAULT_CREDENTIAL_FILES:
+        local_path = Path(cred_path).expanduser()
+        if local_path.exists():
+            mounts[cred_path] = cred_path
+    return mounts
+
+
+def _build_local_command(config_path: str, command: str) -> list[str]:
+    """Build an argv list for a local Oumi CLI invocation (no shell)."""
     oumi_cmd = _COMMAND_MAP.get(command, f"oumi {command}")
-    return f"set -e\n{oumi_cmd} -c {config_path}"
+    parts = oumi_cmd.split()  # e.g. ["oumi", "train"]
+    return [*parts, "-c", config_path]
+
+
+def _build_shell_command(
+    config_path: str,
+    command: str,
+    *,
+    num_nodes: int = 1,
+    accelerators: str | None = None,
+) -> str:
+    """Build the shell command string for an Oumi CLI invocation (cloud runs).
+
+    SkyPilot copies ``working_dir`` to the remote and executes this script
+    from within it, so *config_path* is a relative filename (e.g. ``config.yaml``).
+
+    Extends PATH to cover common uv/pip install locations before executing so
+    the oumi binary is reachable even when the run step's shell differs from
+    the setup step's shell.  Verifies oumi is found before running.
+    """
+    num_gpus = _parse_gpu_count(accelerators)
+    if num_gpus > 1 or num_nodes > 1:
+        oumi_cmd = f"oumi distributed torchrun -m oumi {command}"
+    else:
+        oumi_cmd = _COMMAND_MAP.get(command, f"oumi {command}")
+
+    path_preamble = (
+        'export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"\n'
+        'command -v oumi || { echo "ERROR: oumi not found on PATH after setup"; exit 1; }\n'
+    )
+    return f"set -e\n{path_preamble}{oumi_cmd} -c {shlex.quote(config_path)}"
+
+
+def _stage_cloud_config(
+    record: JobRecord, rt: JobRuntime, *, working_dir: str | None = None
+) -> str:
+    """Copy config (and optionally a working directory) into a per-job run directory.
+
+    For training-config wrapping mode, only the config file is copied.
+    For job-config passthrough mode, pass *working_dir* to copy the entire
+    source directory tree so relative references inside the config are preserved.
+
+    Returns the staged config filename (relative to the run directory).
+    """
+    assert rt.run_dir is not None
+    rt.run_dir.mkdir(parents=True, exist_ok=True)
+
+    if working_dir:
+        src = Path(working_dir).expanduser()
+        if src.is_dir() and src != rt.run_dir:
+            shutil.copytree(src, rt.run_dir, dirs_exist_ok=True)
+        elif src.is_file():
+            shutil.copy2(src, rt.run_dir / src.name)
+
+    staged_config = rt.run_dir / "config.yaml"
+    shutil.copy2(record.config_path, staged_config)
+    rt.staged_config_path = str(staged_config)
+    return staged_config.name
 
 
 def _build_cloud_job_config(
@@ -201,99 +404,261 @@ def _build_cloud_job_config(
     command: str,
     *,
     cloud: str,
-    cluster_name: str | None = None,
+    working_dir: str,
     accelerators: str | None = None,
     job_name: str | None = None,
+    envs: dict[str, str] | None = None,
+    file_mounts: dict[str, str] | None = None,
+    disk_size: int | None = None,
+    use_spot: bool = False,
+    num_nodes: int = 1,
+    setup_script: str = "",
+    run_script: str = "",
 ) -> launcher.JobConfig:
     """Build an ``oumi.launcher.JobConfig`` for **cloud** execution.
 
     For cloud jobs the launcher handles cluster lifecycle via SkyPilot.
-    ``working_dir`` is set to a temporary directory since the launcher
-    copies it to the remote node -- the actual execution uses the
-    ``run`` script which references the config by absolute path.
+    ``working_dir`` is a per-job staging directory copied by the launcher.
+    The run script references the staged config path relative to that directory.
+
+    Automatically selects ``oumi distributed torchrun`` when multiple GPUs or
+    nodes are requested.  Default file mounts include common credential files
+    (``~/.cache/huggingface/token``, ``~/.netrc``) when they exist locally;
+    *file_mounts* entries take precedence and can override them.
+
+    When *setup_script* or *run_script* are provided, they override the
+    defaults (``_DEFAULT_CLOUD_SETUP_SCRIPT`` and the auto-generated run
+    command respectively).
     """
-    run_script = _build_shell_command(config_path, command)
+    effective_run = run_script or _build_shell_command(
+        config_path, command, num_nodes=num_nodes, accelerators=accelerators
+    )
+    effective_setup = setup_script or _DEFAULT_CLOUD_SETUP_SCRIPT
 
     resources = launcher.JobResources(cloud=cloud)
     if accelerators:
         resources.accelerators = accelerators
+    if disk_size is not None:
+        resources.disk_size = disk_size
+    resources.use_spot = use_spot
+    effective_mounts = _default_file_mounts()
+    if file_mounts:
+        effective_mounts.update(file_mounts)
 
     return launcher.JobConfig(
         name=job_name,
+        num_nodes=num_nodes,
         resources=resources,
-        working_dir=".",
-        run=run_script,
+        working_dir=working_dir,
+        setup=effective_setup,
+        run=effective_run,
+        envs=envs or {},
+        file_mounts=effective_mounts,
     )
 
 
-def start_local_job(record: JobRecord) -> None:
+def _generate_job_config_template(
+    config_path: str,
+    command: str,
+    cloud: str,
+    model_name: str,
+    *,
+    client_cwd: str = "",
+    job_name: str = "",
+    accelerators: str = "",
+    num_nodes: int = 1,
+    envs: dict[str, str] | None = None,
+    setup_script: str = "",
+    run_script: str = "",
+) -> str:
+    """Generate a complete, annotated job config YAML template.
+
+    Produces a ready-to-customize YAML string with TODO markers on sections
+    that need user attention. Pre-fills the training command, model info,
+    resources, and auto-detected credential mounts.
+    """
+    from datetime import datetime, timezone
+
+    date_tag = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+    safe_model = model_name.split("/")[-1].lower().replace("-", "").replace("_", "")
+    name = job_name or f"{command}-{safe_model}-{date_tag}"
+
+    if run_script:
+        run_block = run_script
+    else:
+        num_gpus = _parse_gpu_count(accelerators or None)
+        if num_gpus > 1 or num_nodes > 1:
+            run_block = (
+                f"set -e\noumi distributed torchrun -m oumi {command} -c ./config.yaml"
+            )
+        else:
+            oumi_cmd = _COMMAND_MAP.get(command, f"oumi {command}")
+            run_block = f"set -e\n{oumi_cmd} -c ./config.yaml"
+
+    if setup_script:
+        setup_block = setup_script
+    else:
+        setup_block = (
+            "set -e\n"
+            "pip install uv && uv pip install --system 'oumi[gpu]'\n"
+            "# TODO: Add dataset downloads, extra packages, preprocessing\n"
+            "# Example: huggingface-cli download <dataset-id> --repo-type dataset --local-dir ./data\n"
+            "# Example: uv pip install --system 'oumi[gpu,evaluation]'"
+        )
+
+    file_mount_lines = []
+    for cred_path in _DEFAULT_CREDENTIAL_FILES:
+        local_path = Path(cred_path).expanduser()
+        if local_path.exists():
+            file_mount_lines.append(f"  {cred_path}: {cred_path}")
+
+    env_lines = []
+    if envs:
+        for k, v in envs.items():
+            env_lines.append(f"  {k}: {json.dumps(v)}")
+
+    lines = [
+        "# Oumi Cloud Job Config — customize TODO sections before launching",
+        f"# Model: {model_name}",
+        "# Docs: https://oumi.ai/docs/en/latest/user_guides/launch/launch.html",
+        f"name: {name}",
+        "",
+        "resources:",
+        f"  cloud: {cloud}",
+    ]
+    if accelerators:
+        lines.append(f'  accelerators: "{accelerators}"')
+    else:
+        lines.append('  accelerators: "A100:8"  # TODO: Set GPU type and count')
+    lines += [
+        "  use_spot: false",
+        "  disk_size: 500",
+        "",
+        f"num_nodes: {num_nodes}",
+        "working_dir: .  # Resolved to client_cwd at launch time. Synced to ~/sky_workdir on the VM.",
+        "",
+    ]
+
+    if file_mount_lines:
+        lines.append("# Auto-detected credential files (add local dataset mounts below if needed)")
+        lines.append("file_mounts:")
+        lines.extend(file_mount_lines)
+        lines.append("  # TODO: Mount local dataset files if not git-tracked in working_dir")
+        lines.append("  # ~/sky_workdir/data/train.jsonl: /absolute/path/to/local/train.jsonl")
+    else:
+        lines.append("# TODO: Mount credential and data files needed on the remote VM")
+        lines.append("# file_mounts:")
+        lines.append("#   ~/.cache/huggingface/token: ~/.cache/huggingface/token")
+        lines.append("#   ~/sky_workdir/data/train.jsonl: /absolute/path/to/local/train.jsonl")
+    lines.append("")
+
+    lines += [
+        "# TODO: Mount cloud storage for persistent output (recommended for spot instances)",
+        "# storage_mounts:",
+        "#   /output:",
+        "#     source: gs://your-bucket/output",
+        "#     store: gcs",
+        "",
+    ]
+
+    lines.append("envs:")
+    if env_lines:
+        lines.extend(env_lines)
+    else:
+        lines.append(f'  OUMI_RUN_NAME: "{name}"')
+        lines.append("  # TODO: Add env vars (WANDB_API_KEY, HF_TOKEN, etc.)")
+    lines.append("  # Recommended for CUDA memory stability:")
+    lines.append('  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"')
+    lines.append("")
+
+    lines.append("# Setup script — runs once when the VM is provisioned")
+    lines.append("setup: |")
+    for setup_line in setup_block.split("\n"):
+        lines.append(f"  {setup_line}")
+    lines.append("")
+
+    lines.append("# Run command (auto-generated from your training config)")
+    lines.append("run: |")
+    for run_line in run_block.split("\n"):
+        lines.append(f"  {run_line}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def start_local_job(
+    record: JobRecord, rt: JobRuntime, client_cwd: str = ""
+) -> None:
     """Start a local job by spawning the Oumi CLI directly.
 
     Creates the log directory, starts the subprocess via ``Popen``, and
-    sets ``record.process`` and ``record.oumi_job_id``. Raises on failure (e.g. command not found, permission denied).
+    sets ``rt.process`` and ``record.oumi_job_id``. Raises on failure
+    (e.g. command not found, permission denied).
 
-    Bypasses ``oumi.launcher.LocalCluster`` (which requires a
-    ``working_dir``) and instead runs ``oumi <cmd> -c <config>``
-    via ``subprocess.Popen``.
+    When *client_cwd* is provided, the subprocess runs from that directory
+    so relative paths in the config resolve against the user's project root.
 
-    Stdout and stderr are written to files in ``record.log_dir`` so
+    Stdout and stderr are written to files in ``rt.log_dir`` so
     that ``tail_log_file()`` can stream them to the MCP client.
     """
-    run_script = _build_shell_command(record.config_path, record.command)
+    cmd_argv = _build_local_command(record.config_path, record.command)
 
-    record.log_dir.mkdir(parents=True, exist_ok=True)
+    assert rt.log_dir is not None
+    rt.log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(tz=timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
-    stdout_path = record.log_dir / f"{ts}_{record.job_id}.stdout"
-    stderr_path = record.log_dir / f"{ts}_{record.job_id}.stderr"
+    stdout_path = rt.log_dir / f"{ts}_{record.job_id}.stdout"
+    stderr_path = rt.log_dir / f"{ts}_{record.job_id}.stderr"
 
     env = os.environ.copy()
-    env["OUMI_LOGGING_DIR"] = str(record.log_dir)
+    env["OUMI_LOGGING_DIR"] = str(rt.log_dir)
 
     stdout_f = open(stdout_path, "w")
     stderr_f = open(stderr_path, "w")
 
+    popen_kwargs: dict[str, Any] = {
+        "env": env,
+        "stdout": stdout_f,
+        "stderr": stderr_f,
+    }
+    if client_cwd:
+        popen_kwargs["cwd"] = client_cwd
+
     try:
-        proc = subprocess.Popen(
-            run_script,
-            shell=True,
-            env=env,
-            stdout=stdout_f,
-            stderr=stderr_f,
-        )
+        proc = subprocess.Popen(cmd_argv, **popen_kwargs)
     except Exception:
         stdout_f.close()
         stderr_f.close()
         raise
 
-    record.process = proc
+    rt.process = proc
     record.oumi_job_id = str(proc.pid)
-    record._stdout_f = stdout_f  # type: ignore[attr-defined]
-    record._stderr_f = stderr_f  # type: ignore[attr-defined]
+    get_registry().update(
+        record.job_id, oumi_job_id=record.oumi_job_id
+    )
+    rt.stdout_f = stdout_f
+    rt.stderr_f = stderr_f
     logger.info(
         "Local job %s started (pid=%s): %s",
         record.job_id,
         proc.pid,
-        run_script.replace("\n", " && "),
+        " ".join(cmd_argv),
     )
 
 
-async def wait_local_completion(record: JobRecord) -> None:
+async def wait_local_completion(record: JobRecord, rt: JobRuntime) -> None:
     """Await completion of a local job subprocess.
 
-    Waits for the process to exit (in a thread) and sets
-    ``record.error_message`` on non-zero exit code.  This is slow
-    (minutes/hours) and should be run as a background task.
+    Waits for the process to exit (in a thread) and sets ``rt.error_message``
+    on failure.  Status is derived at runtime from ``rt.process.poll()``.
     """
-    proc = record.process
+    proc = rt.process
     if proc is None:
         return
 
-    stdout_f = getattr(record, "_stdout_f", None)
-    stderr_f = getattr(record, "_stderr_f", None)
     stderr_path = None
-    if stderr_f is not None:
+    if rt.stderr_f is not None:
         try:
-            stderr_path = stderr_f.name
+            stderr_path = rt.stderr_f.name
         except Exception:
             pass
 
@@ -301,7 +666,7 @@ async def wait_local_completion(record: JobRecord) -> None:
         returncode = await asyncio.to_thread(proc.wait)
 
         if returncode != 0:
-            record.error_message = f"Process exited with code {returncode}." + (
+            rt.error_message = f"Process exited with code {returncode}." + (
                 f" See stderr: {stderr_path}" if stderr_path else ""
             )
             logger.warning(
@@ -310,159 +675,280 @@ async def wait_local_completion(record: JobRecord) -> None:
         else:
             logger.info("Local job %s completed successfully", record.job_id)
     except Exception as exc:
-        record.error_message = str(exc)
+        rt.error_message = str(exc)
         logger.exception("Failed to run local job %s", record.job_id)
     finally:
-        if stdout_f is not None:
-            stdout_f.close()
-        if stderr_f is not None:
-            stderr_f.close()
+        rt.close_log_files()
 
 
 async def _launch_cloud(
     record: JobRecord,
+    rt: JobRuntime,
     *,
+    client_cwd: str = "",
     accelerators: str | None = None,
+    envs: dict[str, str] | None = None,
+    file_mounts: dict[str, str] | None = None,
+    disk_size: int | None = None,
+    use_spot: bool = False,
+    num_nodes: int = 1,
+    setup_script: str | None = None,
+    run_script: str | None = None,
 ) -> None:
     """Launch a cloud job via ``oumi.launcher.up()``.
 
-    Updates *record* in-place with the cluster object, oumi job ID, and
-    initial status.  On failure, sets ``record.error_message``.
+    Supports two modes:
+
+    * **Job-config passthrough** (when the config file itself is a launcher job
+      config with ``resources``/``setup``/``run`` keys): loads the config directly
+      via ``launcher.JobConfig.from_yaml()`` so all cloud-specific fields
+      (``envs``, ``file_mounts``, ``storage_mounts``, ``disk_size``, etc.) are
+      preserved as written.
+
+    * **Training-config wrapping**: wraps a training YAML in a minimal
+      ``launcher.JobConfig``, applying any caller-supplied *envs*, *file_mounts*,
+      *disk_size*, *use_spot*, *num_nodes*, and *setup_script* overrides on top of
+      sensible defaults (oumi with GPU extras, auto-mounted credential files).
+
+    Updates *record* and *rt* in-place with the cluster object, oumi job ID, and
+    initial status.  On failure, sets ``rt.error_message``.
     """
-    job_config = _build_cloud_job_config(
-        record.config_path,
-        record.command,
-        cloud=record.cloud,
-        cluster_name=record.cluster_name or None,
-        accelerators=accelerators,
-        job_name=record.job_id,
-    )
+    reg = get_registry()
 
     try:
+        config_path = Path(record.config_path)
+        job_config_mode = _is_job_config(config_path)
+
+        if job_config_mode:
+            config_parent = str(Path(record.config_path).expanduser().resolve().parent)
+            _stage_cloud_config(record, rt, working_dir=config_parent)
+            job_config = launcher.JobConfig.from_yaml(rt.staged_config_path)
+            if not job_config.name:
+                job_config.name = record.job_id
+            # Resolve relative working_dir against client_cwd so SkyPilot
+            # syncs the user's project, not the MCP staging directory.
+            if client_cwd and job_config.working_dir:
+                wd = Path(job_config.working_dir).expanduser()
+                if not wd.is_absolute():
+                    job_config.working_dir = str(
+                        (Path(client_cwd) / wd).resolve()
+                    )
+            elif client_cwd and not job_config.working_dir:
+                job_config.working_dir = client_cwd
+            if envs:
+                merged = dict(job_config.envs or {})
+                merged.update(envs)
+                job_config.envs = merged
+            if file_mounts:
+                merged_mounts = dict(job_config.file_mounts or {})
+                merged_mounts.update(file_mounts)
+                job_config.file_mounts = merged_mounts
+        else:
+            staged_config_name = _stage_cloud_config(record, rt)
+            job_config = _build_cloud_job_config(
+                staged_config_name,
+                record.command,
+                cloud=record.cloud,
+                working_dir=client_cwd or str(rt.run_dir),
+                accelerators=accelerators,
+                job_name=record.job_id,
+                envs=envs,
+                file_mounts=file_mounts,
+                disk_size=disk_size,
+                use_spot=use_spot,
+                num_nodes=num_nodes,
+                setup_script=setup_script or "",
+                run_script=run_script or "",
+            )
         cluster, status = await asyncio.to_thread(
             launcher.up,
             job_config,
             record.cluster_name or None,
         )
-        record.cluster_obj = cluster
-        record.oumi_job_id = status.id if status else ""
-        record.oumi_status = status
-        record.cluster_name = status.cluster if status else record.cluster_name
+        rt.cluster_obj = cluster
+        oumi_job_id = status.id if status else ""
+        rt.oumi_status = status
+        cluster_name = status.cluster if status else record.cluster_name
+
+        # Update registry with cloud identity (no status field)
+        reg.update(
+            record.job_id,
+            oumi_job_id=oumi_job_id,
+            cluster_name=cluster_name,
+        )
+        record = reg.get(record.job_id) or record
         logger.info(
             "Cloud job %s launched on %s (oumi_id=%s)",
             record.job_id,
             record.cloud,
             record.oumi_job_id,
         )
+
+        # Race guard: if cancel was requested while launcher.up was in-flight,
+        # immediately cancel the cloud job now that we have an oumi_job_id.
+        if rt.cancel_requested and record.oumi_job_id:
+            try:
+                result_status = await asyncio.to_thread(
+                    launcher.cancel,
+                    record.oumi_job_id,
+                    record.cloud,
+                    record.cluster_name,
+                )
+                rt.oumi_status = result_status
+            except Exception as cancel_exc:
+                rt.error_message = (
+                    "Cancellation was requested during launch, but automatic "
+                    f"cloud cancellation failed: {cancel_exc}"
+                )
+            # Evict cloud runtime after reconciliation — launcher is source of truth now
+            evict_runtime(record.job_id)
+            return
+
+        # Cloud launch succeeded — evict runtime (launcher.status is source of truth)
+        evict_runtime(record.job_id)
     except Exception as exc:
-        record.error_message = str(exc)
+        rt.error_message = str(exc)
         logger.exception("Failed to launch cloud job %s", record.job_id)
 
 
 async def launch_job(
     record: JobRecord,
+    rt: JobRuntime,
     *,
+    client_cwd: str = "",
     accelerators: str | None = None,
+    envs: dict[str, str] | None = None,
+    file_mounts: dict[str, str] | None = None,
+    disk_size: int | None = None,
+    use_spot: bool = False,
+    num_nodes: int = 1,
+    setup_script: str | None = None,
+    run_script: str | None = None,
 ) -> None:
     """Launch a job -- local or cloud -- in a background thread.
 
     For local jobs, spawns the Oumi CLI directly via subprocess.
     For cloud jobs, delegates to ``oumi.launcher.up()``.
     """
-    if record.is_local:
-        start_local_job(record)
-        await wait_local_completion(record)
+    if record.cloud == "local":
+        start_local_job(record, rt, client_cwd=client_cwd)
+        await wait_local_completion(record, rt)
     else:
-        await _launch_cloud(record, accelerators=accelerators)
+        await _launch_cloud(
+            record,
+            rt,
+            client_cwd=client_cwd,
+            accelerators=accelerators,
+            envs=envs,
+            file_mounts=file_mounts,
+            disk_size=disk_size,
+            use_spot=use_spot,
+            num_nodes=num_nodes,
+            setup_script=setup_script,
+            run_script=run_script,
+        )
 
 
-async def poll_status(record: JobRecord) -> OumiJobStatus | None:
-    """Fetch the latest status for a job.
+async def poll_status(record: JobRecord, rt: JobRuntime) -> OumiJobStatus | None:
+    """Fetch the latest status for a job from the launcher.
 
-    For **local** jobs, checks the subprocess return code directly.
-    For **cloud** jobs, tries ``cluster.get_job()`` first, then falls
-    back to ``launcher.status()``.
-
-    Returns an ``OumiJobStatus`` for cloud jobs, or ``None`` for local
-    jobs (status is derived from ``record.process`` instead).
+    For **local** jobs, returns None (status derived from ``rt.process``).
+    For **cloud** jobs, queries the cluster or launcher and updates ``rt.oumi_status``.
     """
-    # ---- Local jobs: derive status from the subprocess ----
-    if record.is_local:
-        # Nothing to poll -- the process handle *is* the status.
+    if record.cloud == "local":
         return None
 
-    # ---- Cloud jobs: delegate to oumi.launcher ----
-    if record.error_message and record.cluster_obj is None:
-        return record.oumi_status
+    if rt.error_message and rt.cluster_obj is None:
+        return rt.oumi_status
 
-    if record.cluster_obj and record.oumi_job_id:
+    # Try cluster.get_job first (fastest path)
+    if rt.cluster_obj and record.oumi_job_id:
         try:
             status = await asyncio.to_thread(
-                record.cluster_obj.get_job, record.oumi_job_id
+                rt.cluster_obj.get_job, record.oumi_job_id
             )
             if status:
-                record.oumi_status = status
+                rt.oumi_status = status
+                # Update registry with cloud identity if it changed
+                reg = get_registry()
+                reg.update(
+                    record.job_id,
+                    oumi_job_id=status.id or record.oumi_job_id,
+                    cluster_name=status.cluster or record.cluster_name,
+                )
                 return status
         except Exception:
-            logger.debug(
-                "cluster.get_job failed for %s, falling back to launcher.status",
+            logger.warning(
+                "cluster.get_job failed for %s; falling back to launcher.status",
                 record.job_id,
+                exc_info=True,
             )
 
+    # Fallback: launcher.status (works even without a cluster object)
     try:
+        if not record.oumi_job_id:
+            return rt.oumi_status
         all_statuses = await asyncio.to_thread(
             launcher.status,
             cloud=record.cloud,
             cluster=record.cluster_name or None,
-            id=record.oumi_job_id or None,
+            id=record.oumi_job_id,
         )
-        for _cloud, jobs in all_statuses.items():
+        for _, jobs in all_statuses.items():
             for s in jobs:
                 if s.id == record.oumi_job_id:
-                    record.oumi_status = s
+                    rt.oumi_status = s
+                    reg = get_registry()
+                    reg.update(
+                        record.job_id,
+                        oumi_job_id=s.id or record.oumi_job_id,
+                        cluster_name=s.cluster or record.cluster_name,
+                    )
                     return s
     except Exception:
-        logger.debug("launcher.status failed for %s", record.job_id)
+        logger.warning(
+            "launcher.status failed for %s; returning stale status",
+            record.job_id,
+            exc_info=True,
+        )
 
-    return record.oumi_status
+    return rt.oumi_status
 
 
-async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse:
+async def cancel(
+    record: JobRecord, rt: JobRuntime, *, force: bool = False
+) -> JobCancelResponse:
     """Cancel a job.
 
-    For **local** jobs, sends SIGTERM (or SIGKILL if *force* is True)
-    to the subprocess.  For **cloud** jobs, delegates to
-    ``oumi.launcher.cancel()``.
-
-    Returns a dict with ``success`` (bool) and ``message`` or ``error``.
+    For **local** jobs, sends SIGTERM (or SIGKILL if *force* is True).
+    For **cloud** jobs, delegates to ``oumi.launcher.cancel()``.
     """
-    if record.is_done:
+    # Pre-launch cancel: job hasn't reached the cloud yet
+    if not record.oumi_job_id and rt.process is None:
+        rt.cancel_requested = True
+        rt.error_message = "Cancellation requested while launch is pending."
+        if rt.runner_task and not rt.runner_task.done():
+            rt.runner_task.cancel()
         return {
-            "success": False,
-            "error": (
-                f"Job {record.job_id} is already finished "
-                f"(status: {record.oumi_status.status if record.oumi_status else 'unknown'})"
+            "success": True,
+            "message": (
+                f"Cancellation requested for {record.job_id}. "
+                "If the cloud launch completes, the MCP will attempt "
+                "best-effort cancellation."
             ),
         }
 
-    if not record.oumi_job_id and record.process is None:
-        if record.runner_task and not record.runner_task.done():
-            record.runner_task.cancel()
-        record.error_message = "Cancelled before launch"
-        return {
-            "success": True,
-            "message": f"Job {record.job_id} cancelled before it was launched.",
-        }
-
-    if record.is_local and record.process is not None:
+    # Local job cancel
+    if record.cloud == "local" and rt.process is not None:
         try:
             if force:
-                record.process.kill()  # SIGKILL
+                rt.process.kill()
                 action = "killed (SIGKILL)"
             else:
-                record.process.terminate()  # SIGTERM
+                rt.process.terminate()
                 action = "terminated (SIGTERM)"
-            record.error_message = f"Cancelled by user ({action})"
+            rt.cancel_requested = True
+            rt.error_message = f"Cancelled by user ({action})"
             logger.info("Local job %s %s", record.job_id, action)
             return {
                 "success": True,
@@ -474,6 +960,7 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
                 "error": f"Failed to cancel local job {record.job_id}: {exc}",
             }
 
+    # Cloud job cancel — delegate to launcher
     try:
         result_status = await asyncio.to_thread(
             launcher.cancel,
@@ -481,10 +968,14 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
             record.cloud,
             record.cluster_name,
         )
-        record.oumi_status = result_status
+        rt.cancel_requested = True
+        rt.oumi_status = result_status
         return {
             "success": True,
-            "message": f"Job {record.job_id} cancel requested on {record.cloud}/{record.cluster_name}.",
+            "message": (
+                f"Job {record.job_id} cancel requested on "
+                f"{record.cloud}/{record.cluster_name}."
+            ),
         }
     except Exception as exc:
         return {
@@ -493,25 +984,15 @@ async def cancel(record: JobRecord, *, force: bool = False) -> JobCancelResponse
         }
 
 
-def get_log_paths(record: JobRecord) -> dict[str, Path | None]:
+def get_log_paths(record: JobRecord, rt: JobRuntime) -> dict[str, Path | None]:
     """Return paths to the stdout and stderr log files for a job.
-
-    For **local** jobs spawned by ``_launch_local()``, files are named
-    ``{timestamp}_{job_id}.stdout`` / ``.stderr``.
-
-    For **cloud** jobs that went through ``oumi.launcher``, the
-    ``LocalClient`` names them ``{timestamp}_{oumi_job_id}.stdout`` /
-    ``.stderr``.
-
-    Since the timestamp prefix varies, we glob for the job/oumi ID
-    suffix first, then fall back to any matching extension.
 
     Returns a dict with ``"stdout"`` and ``"stderr"`` keys, each
     mapping to a ``Path`` or ``None`` if the file doesn't exist yet.
     """
     result: dict[str, Path | None] = {"stdout": None, "stderr": None}
-    log_dir = record.log_dir
-    if not log_dir.is_dir():
+    log_dir = rt.log_dir
+    if log_dir is None or not log_dir.is_dir():
         return result
 
     id_candidates = [record.job_id]
@@ -591,8 +1072,111 @@ async def tail_log_file(
         await asyncio.sleep(poll_interval)
 
 
+async def _get_cloud_logs(
+    record: JobRecord,
+    rt: JobRuntime,
+    lines: int = 200,
+) -> tuple[str, int] | None:
+    """Fetch the last *lines* of logs from a cloud job.
+
+    Uses ``cluster.get_logs_stream()`` which calls ``sky.tail_logs(follow=True)``.
+    Since ``follow=True`` means the stream never ends for running jobs, we read
+    with a timeout and return whatever was accumulated (partial logs are better
+    than nothing).
+    """
+    cluster = rt.cluster_obj
+
+    if cluster is None and record.cloud and record.cluster_name:
+        try:
+            cloud_obj = await asyncio.to_thread(launcher.get_cloud, record.cloud)
+            cluster = await asyncio.to_thread(
+                cloud_obj.get_cluster, record.cluster_name
+            )
+        except Exception:
+            logger.debug(
+                "Failed to reconstruct cluster for %s/%s",
+                record.cloud,
+                record.cluster_name,
+                exc_info=True,
+            )
+            return None
+
+    if cluster is None:
+        logger.debug(
+            "Cluster %s/%s not found (may have been deleted)",
+            record.cloud,
+            record.cluster_name,
+        )
+        return None
+
+    try:
+        stream: io.TextIOBase = await asyncio.to_thread(
+            cluster.get_logs_stream,
+            record.cluster_name,
+            record.oumi_job_id or None,
+        )
+    except NotImplementedError:
+        logger.debug(
+            "Cloud %s does not support get_logs_stream for job %s",
+            record.cloud,
+            record.job_id,
+        )
+        return None
+    except Exception:
+        logger.debug(
+            "get_logs_stream failed for job %s",
+            record.job_id,
+            exc_info=True,
+        )
+        return None
+
+    chunks: list[str] = []
+
+    def _read_stream() -> str:
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                chunks.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        return "".join(chunks)
+
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(_read_stream),
+            timeout=_CLOUD_LOG_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        # Don't cross-thread close the stream — just return partial output.
+        # The worker thread will finish when the stream yields EOF or errors.
+        raw = "".join(chunks)
+        if raw:
+            logger.debug(
+                "Cloud log read timed out for job %s after %.0fs, "
+                "returning %d partial lines",
+                record.job_id,
+                _CLOUD_LOG_TIMEOUT,
+                raw.count("\n"),
+            )
+
+    if not raw:
+        return None
+
+    all_lines = raw.splitlines()
+    tail = all_lines[-lines:] if lines > 0 else all_lines
+    return ("\n".join(tail), len(tail))
+
+
 async def stream_cloud_logs(
     record: JobRecord,
+    rt: JobRuntime,
     done_event: asyncio.Event,
 ) -> AsyncIterator[str]:
     """Yield log lines from ``cluster.get_logs_stream()`` for cloud jobs.
@@ -600,7 +1184,7 @@ async def stream_cloud_logs(
     Falls back silently (returns without yielding) if the cluster does not
     support log streaming (raises ``NotImplementedError``).
     """
-    cluster = record.cluster_obj
+    cluster = rt.cluster_obj
     if cluster is None:
         return
 
@@ -638,9 +1222,15 @@ async def stream_cloud_logs(
             pass
         return lines
 
-    while not done_event.is_set():
-        lines = await asyncio.to_thread(_read_lines)
-        for line in lines:
-            yield line
-        if not lines:
-            await asyncio.sleep(LOG_TAIL_INTERVAL_SECONDS)
+    try:
+        while not done_event.is_set():
+            lines = await asyncio.to_thread(_read_lines)
+            for line in lines:
+                yield line
+            if not lines:
+                await asyncio.sleep(LOG_TAIL_INTERVAL_SECONDS)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass

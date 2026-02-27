@@ -1,5 +1,6 @@
 """Configuration service for parsing and managing Oumi YAML configs."""
 
+import copy
 import logging
 import os
 from functools import lru_cache
@@ -76,6 +77,16 @@ def get_configs_dir() -> Path:
 
 
 @lru_cache(maxsize=YAML_CACHE_SIZE)
+def _parse_yaml_cached(path: str) -> dict[str, Any]:
+    """Parse a YAML file (cached, internal). Callers should use parse_yaml()."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"Failed to parse YAML {path}: {e}")
+        return {}
+
+
 def parse_yaml(path: str) -> dict[str, Any]:
     """Parse a YAML file, returning empty dict on error.
 
@@ -85,12 +96,7 @@ def parse_yaml(path: str) -> dict[str, Any]:
     Returns:
         Parsed YAML as dict, or empty dict if parsing fails.
     """
-    try:
-        with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception as e:
-        logger.warning(f"Failed to parse YAML {path}: {e}")
-        return {}
+    return copy.deepcopy(_parse_yaml_cached(path))
 
 
 def extract_header_comment(path: Path) -> str:
@@ -200,7 +206,9 @@ def determine_peft_type(config: dict[str, Any], path: str) -> PeftType | None:
     """
     peft = config.get("peft", {})
     if peft.get("lora_r"):
-        return "qlora" if "qlora" in path.lower() else "lora"
+        if peft.get("q_lora") or "qlora" in path.lower():
+            return "qlora"
+        return "lora"
     return None
 
 
@@ -232,12 +240,8 @@ def build_metadata(config_path: Path, configs_dir: Path) -> ConfigMetadata:
 
 
 @lru_cache(maxsize=CONFIGS_CACHE_SIZE)
-def get_all_configs() -> list[ConfigMetadata]:
-    """Get metadata for all configs (cached).
-
-    Returns:
-        List of ConfigMetadata for all YAML files in configs directory.
-    """
+def _get_all_configs_cached() -> list[ConfigMetadata]:
+    """Get metadata for all configs (cached, internal)."""
     configs_dir = get_configs_dir()
     configs: list[ConfigMetadata] = []
 
@@ -245,6 +249,21 @@ def get_all_configs() -> list[ConfigMetadata]:
         configs.append(build_metadata(path, configs_dir))
 
     return configs
+
+
+def get_all_configs() -> list[ConfigMetadata]:
+    """Get metadata for all configs (cached).
+
+    Returns:
+        List of ConfigMetadata for all YAML files in configs directory.
+    """
+    return copy.deepcopy(_get_all_configs_cached())
+
+
+def clear_config_caches() -> None:
+    """Invalidate all config LRU caches after config_sync replaces the cache dir."""
+    _get_all_configs_cached.cache_clear()
+    _parse_yaml_cached.cache_clear()
 
 
 def extract_key_settings(config: dict[str, Any]) -> KeySettings:
@@ -290,27 +309,20 @@ def find_config_match(
     path_lower = path_query.lower()
     candidates: list[ConfigMetadata] = []
 
-    # Find all candidates
     for cfg in configs:
         if cfg["path"] == path_query:
-            return cfg  # Exact match found
+            return cfg
         if path_lower in cfg["path"].lower():
             candidates.append(cfg)
 
     if not candidates:
         return None
-
-    # Prefer exact train.yaml match
     for c in candidates:
         if c["path"].endswith(f"/{TRAIN_YAML}"):
             return c
-
-    # Fallback to any train.yaml variant
     for c in candidates:
         if TRAIN_YAML in c["path"]:
             return c
-
-    # Return first candidate
     return candidates[0]
 
 
@@ -319,7 +331,7 @@ def search_configs(
     query: str = "",
     task: str = "",
     model: str = "",
-    keyword: str = "",
+    keyword: str | list[str] = "",
     limit: int = 20,
 ) -> list[ConfigMetadata]:
     """Search for configs matching the given filters.
@@ -329,53 +341,68 @@ def search_configs(
         query: General search term (case-insensitive substring match).
         task: Task type filter.
         model: Model family filter.
-        keyword: Case-insensitive substring match on file content.
+        keyword: Case-insensitive substring match(es) on file content.
+            Pass a list to require all keywords to be present (AND logic).
         limit: Maximum number of results to return.
 
     Returns:
         List of matching ConfigMetadata, sorted by relevance.
     """
+
+    def _tokens(s: str) -> list[str]:
+        return [t.lower() for t in s.split() if t.strip()]
+
     filters: list[str] = []
-    if query:
-        filters.append(query.lower())
-    if task:
-        filters.append(task.lower())
-    if model:
-        filters.append(model.lower())
+    for param in (query, task, model):
+        filters.extend(_tokens(param))
 
-    keyword_lower = keyword.lower().strip()
+    keywords: list[str] = (
+        [k.lower().strip() for k in keyword if k.strip()]
+        if isinstance(keyword, list)
+        else [keyword.lower().strip()]
+        if keyword.strip()
+        else []
+    )
 
-    if not filters and not keyword_lower:
-        # Return a sample of configs sorted alphabetically
+    if not filters and not keywords:
         return sorted(configs, key=lambda x: x["path"])[:limit]
 
     matches: list[ConfigMetadata] = []
-    configs_dir = get_configs_dir() if keyword_lower else None
+    configs_dir = get_configs_dir() if keywords else None
     for cfg in configs:
         path_lower = cfg["path"].lower()
         if not all(f in path_lower for f in filters):
             continue
-        if keyword_lower and configs_dir is not None:
+        if keywords and configs_dir is not None:
             config_path = configs_dir / cfg["path"]
             try:
                 content = config_path.read_text(encoding="utf-8").lower()
             except Exception:
                 continue
-            if keyword_lower not in content:
+            if not all(kw in content for kw in keywords):
                 continue
         matches.append(cfg)
 
-    # Sort: prefer configs with datasets defined, then alphabetically
     matches.sort(key=lambda x: (-len(x["datasets"]), x["path"]))
     return matches[:limit]
 
 
-def get_categories(configs_dir: Path, configs_count: int) -> CategoriesResponse:
+def get_categories(
+    configs_dir: Path,
+    configs_count: int,
+    *,
+    oumi_version: str = "",
+    configs_source: str = "",
+    version_warning: str = "",
+) -> CategoriesResponse:
     """List available config categories and model families.
 
     Args:
         configs_dir: Root configs directory.
         configs_count: Total number of configs.
+        oumi_version: Installed oumi library version (populated by caller).
+        configs_source: Where configs are loaded from (populated by caller).
+        version_warning: Non-empty when configs may be mismatched (populated by caller).
 
     Returns:
         CategoriesResponse with all available categories.
@@ -401,4 +428,7 @@ def get_categories(configs_dir: Path, configs_count: int) -> CategoriesResponse:
         "model_families": model_families,
         "api_providers": api_providers,
         "total_configs": configs_count,
+        "oumi_version": oumi_version,
+        "configs_source": configs_source,
+        "version_warning": version_warning,
     }

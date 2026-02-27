@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools_scm>=8"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +7,12 @@ name = "oumi-mcp"
 version = "0.1.0"
 description = "MCP server for discovering and managing Oumi ML training configs"
 readme = "README.md"
-requires-python = ">=3.10,<3.15"
-license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
 authors = [{ name = "Oumi Team", email = "contact@oumi.ai" }]
+keywords = ["mcp", "llm", "ml", "training", "oumi"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -23,23 +23,61 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastmcp>=3.0.0b1",
+    "fastmcp>=3.0.0b1,<3.0.0rc1",
     "httpx>=0.28.1",
     "huggingface-hub>=0.36.0",
     "mcp[cli]>=1.25.0",
-    "oumi>=0.6.0",
+    "oumi>=0.7,<0.9",
+    "packaging>=22",
     "pyyaml>=6.0",
+    "skypilot-nightly",
+]
+
+[project.optional-dependencies]
+cloud-aws = [
+    "skypilot-nightly[aws]",
+]
+cloud-gcp = [
+    "skypilot-nightly[gcp]",
+]
+cloud-azure = [
+    "skypilot-nightly[azure]",
+]
+cloud-kubernetes = [
+    "skypilot-nightly[kubernetes]",
+]
+cloud-lambda = [
+    "skypilot-nightly[lambda]",
+]
+cloud-all = [
+    "skypilot-nightly[aws,gcp,azure,kubernetes,lambda]",
+]
+test = [
+    "pytest>=9.0",
+]
+dev = [
+    "pytest>=9.0",
+    "build>=1.2.2",
+    "twine>=6.0",
+]
+release = [
+    "build>=1.2.2",
+    "twine>=6.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/oumi-ai/oumi"
 Issues = "https://github.com/oumi-ai/oumi/issues"
+Source = "https://github.com/oumi-ai/oumi/tree/main/projects/oumi-mcp"
 
 [project.scripts]
 oumi-mcp = "oumi_mcp_server.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.package-data]
 oumi_mcp_server = [
@@ -50,3 +88,15 @@ oumi_mcp_server = [
 [tool.uv]
 package = true
 prerelease = "allow"
+
+[tool.pyright]
+pythonVersion = "3.11"
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+exclude = [
+    "src/oumi_mcp_server/configs/projects/",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
